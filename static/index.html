@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#1c302a">
+  <title>想法簿</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar" aria-label="侧栏">
+      <a href="#chat" class="brand">
+        <span class="brand-mark" aria-hidden="true">想</span>
+        <span>想法簿</span>
+      </a>
+      <nav class="navigation" aria-label="应用页面">
+        <a href="#chat" data-page="chat"><span class="nav-icon" aria-hidden="true">◌</span> 对话</a>
+        <a href="#memory" data-page="memory"><span class="nav-icon" aria-hidden="true">▤</span> 记忆</a>
+        <a href="#ops" data-page="ops"><span class="nav-icon" aria-hidden="true">⚙</span> 运维</a>
+      </nav>
+      <div id="session-sidebar"></div>
+    </aside>
+    <main id="main" aria-label="主要内容" aria-busy="true">
+      <div class="splash">正在打开想法簿…</div>
+    </main>
+  </div>
+  <div id="notice" class="notice" role="status" hidden></div>
+</body>
+</html>
