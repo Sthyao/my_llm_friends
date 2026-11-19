@@ -39,6 +39,7 @@ class ApiMonitorTests(unittest.TestCase):
         self.llm = llm
         self.expert_response = None
         self.poe_response = self.normal_reply
+        self.poe_model_code = "deepseek-v3.2"
         stack.enter_context(patch("thought_app.llm.httpx.AsyncClient", mocked_async_client))
         stack.enter_context(patch("thought_app.sides.SIDE_PROBABILITY", 0))
         self.client = stack.enter_context(TestClient(app))
@@ -60,7 +61,7 @@ class ApiMonitorTests(unittest.TestCase):
         if request.url.host == "api.poe.com":
             self.assertEqual(request.url.path, "/v1/chat/completions")
             self.assertEqual(request.headers["Authorization"], f"Bearer {self.POE_KEY}")
-            self.assertEqual(json.loads(request.content)["model"], "deepseek-v3.2")
+            self.assertEqual(json.loads(request.content)["model"], self.poe_model_code)
             return self.poe_response(request)
         self.assertEqual(request.url.host, "api.deepseek.com")
         if request.url.path == "/anthropic/v1/messages":
@@ -78,6 +79,52 @@ class ApiMonitorTests(unittest.TestCase):
 
     def health(self):
         return self.client.post(f"/api/config/providers/{self.poe['id']}/test", json={"model_id": self.model["id"]})
+
+    def test_model_probe_calls_the_exact_model_and_reports_observed_metrics(self):
+        self.poe_model_code = "synthetic-new-model"
+        model = self.checked(self.client.post("/api/config/models", json={
+            "name": "待启用模型", "provider_id": self.poe["id"],
+            "model_code": self.poe_model_code, "enabled": False,
+        }))
+        route = f"/api/config/models/{model['id']}/test"
+
+        def verify_probe_request(request):
+            self.assertEqual(json.loads(request.content)["max_tokens"], 12)
+            return self.normal_reply(request)
+
+        self.poe_response = verify_probe_request
+        result = self.checked(self.client.post(route))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["outcome"], "success")
+        self.assertEqual((result["model_id"], result["model_code"]), (model["id"], self.poe_model_code))
+        self.assertEqual(result["http_status"], 200)
+        self.assertGreaterEqual(result["latency_ms"], 0)
+        self.assertEqual((result["input_tokens"], result["output_tokens"], result["total_tokens"]), (18, 3, 21))
+        event = self.read_monitor(model_id=model["id"])["recent"][0]
+        self.assertEqual((event["task"], event["latency_ms"]), ("health", result["latency_ms"]))
+        config = self.checked(self.client.get("/api/config"))
+        self.assertFalse(next(row for row in config["models"] if row["id"] == model["id"])["enabled"])
+
+    def test_model_probe_reports_sanitized_failures_and_missing_metrics(self):
+        route = f"/api/config/models/{self.model['id']}/test"
+
+        def timeout(request):
+            raise httpx.ReadTimeout(self.RAW_UPSTREAM_ERROR)
+
+        for respond, outcome, status in (
+            (lambda request: httpx.Response(401, json={"error": self.RAW_UPSTREAM_ERROR}), "auth", 401),
+            (timeout, "timeout", None),
+        ):
+            with self.subTest(outcome=outcome):
+                self.poe_response = respond
+                result = self.checked(self.client.post(route))
+                self.assertFalse(result["ok"])
+                self.assertGreaterEqual(result["latency_ms"], 0)
+                self.assertEqual((result["outcome"], result["http_status"]), (outcome, status))
+                self.assertIsNone(result["total_tokens"])
+                self.assertNotIn(self.RAW_UPSTREAM_ERROR, json.dumps(result))
+                self.assertNotIn(self.POE_KEY, json.dumps(result))
+        self.assertEqual(self.client.post("/api/config/models/999999/test").status_code, 404)
 
     def test_experts_can_search_and_keep_provider_citations(self):
         experts = [b for b in self.config["bots"] if b["name"].endswith("专家")]
@@ -103,6 +150,34 @@ class ApiMonitorTests(unittest.TestCase):
             self.assertEqual(answer["bot_id"], bot["id"])
             self.assertIn("https://example.org/study", answer["content"])
             self.assertNotIn("hidden", answer["content"])
+            event = self.read_monitor(web_only=True)["recent"][0]
+            self.assertEqual((event["task"], event["search_count"], event["read_count"]), ("reply", 1, 0))
+
+    def test_manual_web_search_reports_tool_use_and_unknown_failures(self):
+        bot = next(b for b in self.config["bots"] if b["can_web_search"])
+        path = f"/api/config/bots/{bot['id']}/web-search"
+        question = {"query": self.PRIVATE_TEXT}
+        for counters, expected in [({"tool_search": 3, "tool_fetch": 2}, (3, 2)), ({}, (0, 0))]:
+            self.expert_response = lambda request: httpx.Response(200, json={
+                "stop_reason": "end_turn", "usage": {"server_tool_use": counters},
+                "content": [{"type": "text", "text": "测试答复"}],
+            })
+            result = self.checked(self.client.post(path, json=question))
+            self.assertEqual((result["search_count"], result["read_count"]), expected)
+
+        self.expert_response = lambda request: httpx.Response(503)
+        self.assertEqual(self.client.post(path, json=question).status_code, 502)
+        self.checked(self.health())
+        monitor = self.read_monitor(web_only=True)
+        self.assertEqual(monitor["totals"]["calls"], 3)
+        self.assertEqual(monitor["totals"]["search_count"], 3)
+        self.assertEqual(monitor["totals"]["read_count"], 2)
+        self.assertIsNone(monitor["recent"][0]["search_count"])
+        self.assertTrue(all(row["task"] == "web_search_test" for row in monitor["recent"]))
+        self.assertNotIn(self.PRIVATE_TEXT, json.dumps(monitor))
+        self.assertEqual(self.checked(self.client.get("/api/sessions")), [])
+        self.checked(self.client.patch(f"/api/config/bots/{bot['id']}", json={"enabled": False}))
+        self.assertEqual(self.client.post(path, json=question).status_code, 400)
 
     def test_switching_a_bot_model_routes_its_reply_and_records_the_actual_provider(self):
         self.assertEqual(self.poe["base_url"], "https://api.poe.com/v1")

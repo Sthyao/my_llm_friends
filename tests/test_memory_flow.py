@@ -283,6 +283,60 @@ class MemoryFlowTests(unittest.TestCase):
         self.assertEqual(answer["reply_to"], opening["id"])
         self.assertEqual(answer["content"], "我喜欢你写的树影。")
 
+    def test_configured_router_and_formatter_recover_without_rewriting_the_original_draft(self):
+        config = self.checked(self.client.get("/api/config"))
+        persona = config["models"][0]
+        router, formatter = [self.checked(self.client.post("/api/config/models", json={
+            "provider_id": persona["provider_id"], "name": name, "model_code": code,
+        })) for name, code in (("路由", "router"), ("格式修复", "formatter"))]
+        self.checked(self.client.patch("/api/config/reply-models", json={
+            "router_model_id": router["id"], "fallback_model_id": formatter["id"],
+        }))
+        wording = "今天想先把结构弄清楚，然后再改。"
+        calls = []
+
+        async def reply_with_recovery(settings, messages, **options):
+            task = settings["task"]
+            if task not in {"route", "reply", "reply_repair", "reply_retry"}:
+                return await self.fake_complete(settings, messages, **options)
+            calls.append((task, settings["id"]))
+            if task == "route":
+                return await self.fake_complete(settings, messages, **options)
+            packet = json.loads(messages[-1]["content"])
+            result = {"reply": wording, "address": packet["本次发言"], "sources": []}
+            if task == "reply":
+                if packet["接这条消息"]["content"] == "结构化草稿":
+                    return json.dumps(result, ensure_ascii=False)[:-1]
+                return wording
+            if task == "reply_repair":
+                self.assertEqual(set(packet), {"本次发言", "待修复输出"})
+                if packet["待修复输出"] == wording:
+                    result["reply"] = "今天"
+            if task == "reply_retry":
+                self.assertEqual(settings["bot_id"], self.bots[0]["id"])
+                self.assertIn("重新回答这一条消息", messages[0]["content"])
+                result["reply"] = "可以先保留一份结构，再动正文。"
+            return json.dumps(result, ensure_ascii=False)
+
+        with patch("thought_app.llm.complete", reply_with_recovery):
+            session_id = self.create_session("格式恢复")
+            repaired = self.send(session_id, "结构化草稿")
+            self.assertEqual(calls, [("route", router["id"]), ("reply", persona["id"]), ("reply_repair", formatter["id"])])
+            self.assertFalse(repaired["errors"])
+            self.assertEqual(repaired["messages"][1]["content"], wording)
+            self.assertEqual(repaired["messages"][1]["model_code"], persona["model_code"])
+
+            calls.clear()
+            reanswered = self.send(session_id, "纯文本草稿")
+            self.assertEqual(calls, [("route", router["id"]), ("reply", persona["id"]),
+                                     ("reply_repair", formatter["id"]), ("reply_retry", router["id"])])
+            self.assertFalse(reanswered["errors"])
+            user, answer = reanswered["messages"]
+            self.assertEqual(answer["content"], "可以先保留一份结构，再动正文。")
+            self.assertEqual(answer["reply_to"], user["id"])
+            self.assertEqual(answer["bot_id"], self.bots[0]["id"])
+            self.assertEqual(answer["model_code"], router["model_code"])
+
     def test_one_other_eligible_friend_answers_when_primary_fails(self):
         first, second = self.bots[:2]
         session_id = self.create_session("接力")
@@ -699,6 +753,37 @@ class MemoryFlowTests(unittest.TestCase):
         }))
         settled = self.wait_session(session_id, lambda detail: not detail["side_active"])
         self.assertEqual(settled["messages"][-1]["reply_to"], user["id"])
+
+    def test_manual_sidebar_invitation_retries_or_reports_an_empty_reply(self):
+        from thought_app.conversation import Conversation
+
+        session_id = self.create_session("请接我的原话")
+        [user] = self.send(session_id, "这句先记下来。", bots=[])["messages"]
+        invite = {"bot_id": self.bots[1]["id"], "message_id": user["id"]}
+
+        async def silent(settings, prompt):
+            packet = json.loads(prompt.rsplit("\n", 1)[1])
+            self.assertEqual(packet["本次发言"], {
+                "from": f"bot:{invite['bot_id']}", "to": "user", "reply_to": user["id"],
+            })
+            self.assertEqual(packet["接这条消息"]["content"], user["content"])
+            return None
+
+        self.aside = silent
+        self.checked(self.client.post(f"/api/sessions/{session_id}/side", json=invite))
+        settled = self.wait_session(session_id, lambda detail: not detail["side_active"])
+        self.assertEqual(len(self.aside_prompts), 2)
+        self.assertEqual(len(settled["messages"]), 1)
+        self.assertIn("可显示", settled["side_error"])
+
+        self.aside = self.default_reply
+        self.checked(self.client.post(f"/api/sessions/{session_id}/side", json=invite))
+        settled = self.wait_session(session_id, lambda detail: not detail["side_active"])
+        self.assertIsNone(settled["side_error"])
+        [_, interjection] = settled["messages"]
+        self.assertEqual((interjection["channel"], interjection["reply_to"]), ("aside", user["id"]))
+        self.assertEqual(Conversation(settled["messages"]).event(interjection)["to"], ["user"])
+        self.assertEqual(len(self.route_prompts), 0)
 
     def test_wrong_recipient_is_retried_and_never_posted(self):
         async def misaddressed(settings, prompt):

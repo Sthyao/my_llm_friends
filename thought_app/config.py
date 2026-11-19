@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .database import connect
-from .llm import ModelError, complete
+from .llm import ModelError, complete, supports_web_search
 from .prompts import load_prompt
 
 
@@ -296,11 +296,11 @@ def provider_key(provider: sqlite3.Row) -> str | None:
     return None
 
 
-def get_model(conn: sqlite3.Connection, model_id: int) -> dict:
+def get_model(conn: sqlite3.Connection, model_id: int, *, allow_disabled: bool = False) -> dict:
     model = conn.execute("SELECT * FROM models WHERE id = ?", (model_id,)).fetchone()
     if model is None:
         raise HTTPException(404, "模型不存在。")
-    if not model["enabled"]:
+    if not model["enabled"] and not allow_disabled:
         raise HTTPException(400, f"模型「{model['name']}」已停用。")
     provider = conn.execute(
         "SELECT * FROM providers WHERE id = ?", (model["provider_id"],)
@@ -352,6 +352,28 @@ def set_summary_model_id(conn: sqlite3.Connection, model_id: int) -> None:
            ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
         (str(model_id),),
     )
+
+
+_REPLY_MODEL_KEYS = ("router_model_id", "fallback_model_id")
+
+
+def _enabled_reply_model_id(conn: sqlite3.Connection, key: str) -> int | None:
+    row = conn.execute("""
+        SELECT models.id FROM models JOIN config_settings
+        ON config_settings.value = CAST(models.id AS TEXT)
+        WHERE config_settings.key = ? AND models.enabled = 1
+    """, (key,)).fetchone()
+    return row["id"] if row else None
+
+
+def get_router_model(conn: sqlite3.Connection) -> dict | None:
+    model_id = _enabled_reply_model_id(conn, "router_model_id")
+    return get_model(conn, model_id) if model_id is not None else None
+
+
+def get_fallback_model(conn: sqlite3.Connection) -> dict | None:
+    model_id = _enabled_reply_model_id(conn, "fallback_model_id")
+    return get_model(conn, model_id) if model_id is not None else None
 
 
 class ConfigInput(BaseModel):
@@ -487,6 +509,28 @@ def update_reply_preferences(body: ReplyPreferences):
     return body
 
 
+class ReplyModels(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    router_model_id: Annotated[int | None, Field(gt=0)] = None
+    fallback_model_id: Annotated[int | None, Field(gt=0)] = None
+
+
+@router.patch("/reply-models")
+def update_reply_models(body: ReplyModels):
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for key, model_id in body.model_dump(exclude_unset=True).items():
+            if model_id is None:
+                conn.execute("DELETE FROM config_settings WHERE key = ?", (key,))
+            else:
+                get_model(conn, model_id)
+                conn.execute("""
+                    INSERT INTO config_settings (key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """, (key, str(model_id)))
+        return {key: _enabled_reply_model_id(conn, key) for key in _REPLY_MODEL_KEYS}
+
+
 @router.get("")
 def config_state() -> dict:
     with connect() as conn:
@@ -497,7 +541,17 @@ def config_state() -> dict:
             ]
             for collection in INPUTS
         }
-        return {**config, "summary_model_id": get_summary_model_id(conn), "long_replies": long_replies_enabled(conn)}
+        online_personas = {p["id"] for p in config["personas"] if p["web_search"]}
+        enabled_models = {m["id"] for m in config["models"] if m["enabled"]}
+        for bot in config["bots"]:
+            bot["can_web_search"] = False
+            if bot["enabled"] and bot["model_id"] in enabled_models and bot["persona_id"] in online_personas:
+                settings = get_bot(conn, bot["id"])
+                bot["can_web_search"] = bool(supports_web_search(settings) and settings["api_key"])
+        return {
+            **config, **{key: _enabled_reply_model_id(conn, key) for key in _REPLY_MODEL_KEYS},
+            "summary_model_id": get_summary_model_id(conn), "long_replies": long_replies_enabled(conn),
+        }
 
 
 @router.post("/{collection}", status_code=201)
@@ -546,6 +600,56 @@ def delete_config(collection: Collection, item_id: int) -> Response:
     return Response(status_code=204)
 
 
+class WebSearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    query: str = Field(min_length=1, max_length=3000)
+
+
+@router.post("/bots/{bot_id}/web-search")
+async def run_web_search(bot_id: int, body: WebSearchRequest):
+    with connect() as conn:
+        bot = get_bot(conn, bot_id)
+    if not supports_web_search(bot):
+        raise HTTPException(400, "请选择启用了官方 DeepSeek Flash 联网工具的专家。")
+    sources, usage = {}, {}
+    messages = [
+        {"role": "system", "content": bot["prompt"] + "\n请使用联网工具核实下面的问题或读取提供的网页，简洁回答。"},
+        {"role": "user", "content": body.query},
+    ]
+    try:
+        has_link = any(prefix in body.query.lower() for prefix in ("http://", "https://"))
+        answer = await complete({**bot, "task": "web_search_test"}, messages, max_tokens=1200,
+                                web_sources=sources, read_links=has_link, web_usage=usage)
+    except ModelError as exc:
+        raise HTTPException(502, str(exc)) from None
+    return {"answer": answer, "sources": [{"title": t, "url": u} for u, t in sources.items()], **usage}
+
+
+async def probe_model(model: dict) -> dict:
+    metrics = {"input_tokens": None, "output_tokens": None, "total_tokens": None}
+    try:
+        await complete(
+            {**model, "task": "health"}, [{"role": "user", "content": "Only reply OK."}],
+            max_tokens=12, call_metrics=metrics,
+        )
+    except ModelError as error:
+        ok, message = False, str(error)
+    else:
+        ok, message = True, f"调用成功 · {model['name']}"
+    return {
+        "ok": ok, "message": message,
+        "model_id": model["id"], "model_name": model["name"], "model_code": model["model_code"],
+        "provider_id": model["provider_id"], "provider_name": model["provider_name"], **metrics,
+    }
+
+
+@router.post("/models/{model_id}/test")
+async def test_model(model_id: int) -> dict:
+    with connect() as conn:
+        model = get_model(conn, model_id, allow_disabled=True)
+    return await probe_model(model)
+
+
 @router.post("/providers/{provider_id}/test")
 async def test_provider(provider_id: int, body: ProviderTest | None = None) -> dict:
     with connect() as conn:
@@ -562,8 +666,7 @@ async def test_provider(provider_id: int, body: ProviderTest | None = None) -> d
             if row is None:
                 raise HTTPException(400, "请先添加并启用一个属于这个 API 的模型。")
         model = get_model(conn, row["id"])
-    try:
-        await complete({**model, "task": "health"}, [{"role": "user", "content": "Only reply OK."}], max_tokens=12)
-    except ModelError as error:
-        raise HTTPException(502, str(error)) from None
+    result = await probe_model(model)
+    if not result["ok"]:
+        raise HTTPException(502, result["message"])
     return {"message": f"连接成功 · {model['name']}"}

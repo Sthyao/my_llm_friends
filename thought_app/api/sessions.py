@@ -2,12 +2,12 @@ from fastapi import APIRouter, HTTPException, Request, Response
 
 from ..chat import chat
 from ..database import connect
-from ..evolution import rewind_evolution
 from ..journal import (
     ChatInput, InterjectInput, RewindInput, SessionCreate, SessionPatch, SESSION_SELECT,
     clean_session, get_messages, get_session, get_summary, timestamp,
 )
 from ..observer import observer_failed_count, observer_pending_count, session_observations
+from ..rewind import rewind_history
 
 
 router = APIRouter(prefix="/api/sessions")
@@ -45,6 +45,7 @@ async def session_detail(request: Request, session_id: int):
             "observations": session_observations(db, session_id),
             "observer_pending": observer_pending_count(db, session_id),
             "observer_failed": observer_failed_count(db, session_id),
+            "chat_active": session_id in runtime.chats,
             "side_active": session_id in runtime.sides.tasks,
             "side_error": runtime.sides.errors.get(session_id),
         }
@@ -92,10 +93,11 @@ async def chat_route(request: Request, session_id: int, body: ChatInput):
     active = runtime.chats
     if session_id in active:
         raise HTTPException(409, "这一轮还在生成，请等机器人回复。")
+    if body.rewind_message_id is not None and session_id in runtime.summaries:
+        raise HTTPException(409, "当前会话正在生成内容，等它完成后再回退。")
     active.add(session_id)
-    runtime.sides.stop(session_id)
     try:
-        outcome, intent = await chat(session_id, body, runtime.observer_wake)
+        outcome, intent = await chat(session_id, body, runtime.observer_wake, stop_side=runtime.sides.stop)
         runtime.sides.maybe_start(session_id, outcome, intent, body.bot_ids)
         return {**outcome, "side_active": session_id in runtime.sides.tasks}
     finally:
@@ -130,39 +132,11 @@ async def rewind_session(request: Request, session_id: int, body: RewindInput):
         session = get_session(db, session_id)
         if session["archived"]:
             raise HTTPException(409, "恢复会话后就可以回退。")
-        target = db.execute(
-            "SELECT role, content FROM messages WHERE session_id = ? AND id = ?",
-            (session_id, body.message_id),
-        ).fetchone()
-        if target is None:
-            raise HTTPException(404, "这条消息不在当前会话中。")
-        if target["role"] != "user":
-            raise HTTPException(422, "请从一条自己的消息开始回退。")
-
-        runtime.sides.stop(session_id)
-        restored = rewind_evolution(db, session_id, body.message_id)
-        summary = get_summary(db, session_id)
-        summary_removed = bool(summary and (
-            summary["through_message_id"] >= body.message_id or any(
-                source_id >= body.message_id
-                for field in ("views", "observations")
-                for point in summary[field]
-                for source_id in point["source_ids"]
-            )
-        ))
-        if summary_removed:
-            db.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
-        cutoff = (session_id, body.message_id)
-        removed = db.execute(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ? AND id >= ?", cutoff,
-        ).fetchone()[0]
-        db.execute("DELETE FROM messages WHERE session_id = ? AND id >= ?", cutoff)
+        result = rewind_history(db, session_id, body.message_id)
         db.execute("""
             INSERT INTO rewind_drafts (session_id, content) VALUES (?, ?)
             ON CONFLICT(session_id) DO UPDATE SET content = excluded.content
-        """, (session_id, target["content"]))
+        """, (session_id, result["draft"]))
         db.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (timestamp(), session_id))
-        return {
-            "draft": target["content"], "removed_count": removed,
-            "summary_removed": summary_removed, "restored_note_count": restored,
-        }
+    runtime.sides.stop(session_id)
+    return result

@@ -78,6 +78,31 @@ def supports_web_search(bot):
             and bot["base_url"].rstrip("/") in {"https://api.deepseek.com", "https://api.deepseek.com/v1"})
 
 
+def web_tool_counts(data):
+    """Use provider counters when available, otherwise count returned server tool steps."""
+    usage = data.get("usage")
+    report = usage.get("server_tool_use") if isinstance(usage, dict) else None
+    blocks = data.get("content")
+    counts = {"search_count": None, "read_count": None}
+    if isinstance(blocks, list) and data.get("stop_reason") == "end_turn":
+        counts = {"search_count": 0, "read_count": 0}
+        for block in blocks:
+            if not isinstance(block, dict) or block.get("type") != "server_tool_use":
+                continue
+            action = (block.get("input") or {}).get("action")
+            if block.get("name") == "deepseek_read_url" or action == "open_page":
+                counts["read_count"] += 1
+            elif block.get("name") == "deepseek_web_search" and action in {None, "search"}:
+                if block.get("kind") not in {"image_search", "deep_image_search"}:
+                    counts["search_count"] += 1
+    if isinstance(report, dict):
+        for field, counter in (("search_count", "tool_search"), ("read_count", "tool_fetch")):
+            value = report.get(counter)
+            if type(value) is int and value >= 0:
+                counts[field] = value
+    return counts
+
+
 def expert_answer(data, sources):
     if data.get("error"):
         raise ModelError("DeepSeek 搜索服务未能完成本次回复。", "upstream")
@@ -95,10 +120,12 @@ def expert_answer(data, sources):
     return "".join(parts)
 
 
-async def complete(settings, messages, *, max_tokens=650, json_output=False, web_sources=None, read_links=False):
+async def complete(settings, messages, *, max_tokens=650, json_output=False, web_sources=None, read_links=False,
+                   web_usage=None, call_metrics=None):
     started = perf_counter()
     status = None
     usage = {}
+    web_counts = {}
     outcome, detail = "upstream", None
     try:
         if not settings["api_key"]:
@@ -110,7 +137,7 @@ async def complete(settings, messages, *, max_tokens=650, json_output=False, web
             "max_tokens": max_tokens,
         }
         if web_sources is not None:
-            if not supports_web_search(settings) or settings.get("task") not in {"reply", "aside"}:
+            if not supports_web_search(settings) or settings.get("task") not in {"reply", "aside", "web_search_test"}:
                 raise ModelError("此人格或模型无法使用 DeepSeek 联网工具。", "config")
             url = "https://api.deepseek.com/anthropic/v1/messages"
             headers = {"x-api-key": settings["api_key"], "anthropic-version": "2023-06-01"}
@@ -148,6 +175,9 @@ async def complete(settings, messages, *, max_tokens=650, json_output=False, web
             data = response.json()
             usage = usage_tokens(data)
             if web_sources is not None:
+                web_counts = web_tool_counts(data)
+                if web_usage is not None:
+                    web_usage.update(web_counts)
                 body = expert_answer(data, web_sources)
             else:
                 choice = data["choices"][0]
@@ -167,13 +197,16 @@ async def complete(settings, messages, *, max_tokens=650, json_output=False, web
         outcome = "cancelled"
         raise
     finally:
+        latency_ms = round((perf_counter() - started) * 1000)
+        if call_metrics is not None:
+            call_metrics.update(outcome=outcome, latency_ms=latency_ms, http_status=status, **usage)
         try:
             recorded = settings
             if settings.get("task") in {"route", "aside_route"}:
                 recorded = {**settings, "bot_name": None}
             record_call(
-                recorded, outcome=outcome, latency_ms=round((perf_counter() - started) * 1000),
-                http_status=status, detail=detail, **usage,
+                recorded, outcome=outcome, latency_ms=latency_ms,
+                http_status=status, detail=detail, web_enabled=web_sources is not None, **web_counts, **usage,
             )
         except Exception as exc:
             _LOG.warning("API usage recording failed (%s)", type(exc).__name__)

@@ -60,6 +60,10 @@ def init_telemetry(db):
         CREATE INDEX IF NOT EXISTS api_usage_calls_provider ON api_usage_calls(provider_id, created_at);
         CREATE INDEX IF NOT EXISTS api_usage_calls_model ON api_usage_calls(model_id, created_at);
     """)
+    columns = {row["name"] for row in db.execute("PRAGMA table_info(api_usage_calls)")}
+    for column in ("web_enabled", "search_count", "read_count"):
+        if column not in columns:
+            db.execute(f"ALTER TABLE api_usage_calls ADD COLUMN {column} INTEGER")
 
 
 def _timestamp(instant=None):
@@ -84,7 +88,8 @@ def _label(value, fallback, credential):
 
 def record_call(settings, *, outcome: str, latency_ms: int, http_status: int | None = None,
                 input_tokens: int | None = None, output_tokens: int | None = None,
-                total_tokens: int | None = None, detail: str | None = None) -> None:
+                total_tokens: int | None = None, detail: str | None = None,
+                web_enabled=False, search_count=None, read_count=None) -> None:
     """Store an operational event without retaining request or provider error bodies."""
     if outcome not in _DETAILS:
         outcome = "upstream"
@@ -123,12 +128,12 @@ def record_call(settings, *, outcome: str, latency_ms: int, http_status: int | N
                 INSERT INTO api_usage_calls (
                     created_at, provider_id, provider_name, model_id, model_name, model_code, task,
                     bot_name, outcome, latency_ms, http_status, input_tokens, output_tokens,
-                    total_tokens, detail, alert_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    total_tokens, detail, alert_id, web_enabled, search_count, read_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 created_at, provider_id, provider_name, model_id, model_name, model_code, task,
                 bot_name, outcome, _metric(latency_ms) or 0, http_status, input_tokens,
-                output_tokens, total_tokens, _DETAILS[outcome], alert_id,
+                output_tokens, total_tokens, _DETAILS[outcome], alert_id, int(web_enabled), _metric(search_count), _metric(read_count),
             ))
     except (sqlite3.Error, OSError) as error:
         _LOG.warning("API telemetry write failed (%s)", type(error).__name__)
@@ -143,6 +148,7 @@ _METRICS = """
     SUM(total_tokens) AS total_tokens,
     COUNT(CASE WHEN input_tokens IS NOT NULL OR output_tokens IS NOT NULL OR total_tokens IS NOT NULL THEN 1 END)
         AS usage_reports,
+    SUM(search_count) AS search_count, SUM(read_count) AS read_count,
     ROUND(AVG(latency_ms)) AS avg_latency_ms
 """
 
@@ -152,10 +158,13 @@ def monitor_state(
     period: Literal["24h", "7d", "30d"] = "24h",
     provider_id: int | None = Query(default=None, gt=0),
     model_id: int | None = Query(default=None, gt=0),
+    web_only: bool = False,
 ):
     cutoff = _timestamp(datetime.now(timezone.utc) - timedelta(hours=_PERIOD_HOURS[period]))
     clauses = ["created_at >= ?"]
     params = [cutoff]
+    if web_only:
+        clauses.append("web_enabled = 1")
     for column, value in (("provider_id", provider_id), ("model_id", model_id)):
         if value is not None:
             clauses.append(f"{column} = ?")
@@ -192,7 +201,7 @@ def monitor_state(
         recent = db.execute(f"""
             SELECT id, created_at, provider_id, provider_name, model_id, model_name, model_code,
                    task, bot_name, outcome, latency_ms, http_status, input_tokens, output_tokens,
-                   total_tokens, detail
+                   total_tokens, detail, web_enabled, search_count, read_count
             FROM api_usage_calls WHERE {where} ORDER BY created_at DESC, id DESC LIMIT 100
         """, params).fetchall()
     return {

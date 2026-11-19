@@ -8,7 +8,7 @@ from fastapi import HTTPException
 
 from . import llm
 from .chat import candidates_packet, enabled_bots, group_members, save_bot_reply, speak, structured_response
-from .config import get_bot
+from .config import get_bot, get_router_model
 from .conversation import Conversation
 from .database import connect
 from .journal import get_messages, get_session
@@ -104,6 +104,8 @@ async def side_reply(session_id, bot, messages, turn, target, reason, *, directe
         directed=directed, shared=shared, shared_citations=citations, aside=True,
     )
     if result is None:
+        if directed:
+            raise llm.ModelError("这位角色没有返回可显示的接话，请重试。")
         return None
     return save_bot_reply(session_id, bot, turn, target, result, channel="aside")
 
@@ -123,9 +125,9 @@ async def automatic_exchange(session_id, turn_id, first_reply_id, selected):
         if not others:
             return
         shared, citations, _ = recall(db, session_id, messages)
+        router = get_router_model(db) or next((bot for bot in others if bot["api_key"]), others[0])
 
     conversation = Conversation(messages)
-    router = next((bot for bot in others if bot["api_key"]), others[0])
     raw = await llm.complete({**router, "task": "aside_route"}, [
         {"role": "system", "content": (
             "你只为侧栏选一位能接指定发言的人。找确实想接着聊、有具体想法的朋友，"

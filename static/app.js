@@ -8,7 +8,7 @@ const collections = {
   bots: { name: '机器人', item: '机器人', empty: '将一个模型和一种人格绑定为机器人。' },
   personas: { name: '人格模板', item: '人格模板', empty: '定义一个机器人在讨论中的角色和回答习惯。' },
 };
-const monitorTabs = { monitor: '使用监控', alerts: 'API 告警' };
+const monitorTabs = { monitor: '使用监控', web: '网页搜索', alerts: 'API 告警' };
 const speakerVoices = new Map([
   ['造梦师', 'dream'],
   ['刺头', 'critic'],
@@ -19,9 +19,11 @@ const state = {
   config: null, sessions: [], detail: null, route: null, loadId: 0, failed: '',
   search: '', sideOpen: !matchMedia('(max-width: 680px)').matches,
   drafts: new Map(), pending: new Map(), chatErrors: new Map(),
-  summaryJobs: new Set(), rewindJobs: new Set(), noticeTimer: null, summaryModels: new Map(),
+  summaryJobs: new Set(), rewindEditors: new Map(), noticeTimer: null, summaryModels: new Map(),
   evolution: null, sideTargetId: null, sideJobs: new Set(), openedAsides: new Set(), openedCalls: new Set(), pollTimer: null,
+  webSearch: { busy: false, query: '', botId: '', result: null, error: '' },
   monitor: null, monitorFilters: { period: '24h', provider_id: '', model_id: '' },
+  modelTests: new Map(),
 };
 
 function esc(value) {
@@ -147,7 +149,22 @@ function referenceLink(reference, label) {
   return `<a class="reference" href="${href('memory', Number(reference.session_id), Number(reference.message_id))}">${esc(label || reference.label || reference.session_title || '查看出处')}</a>`;
 }
 
-function renderMessage(message, { highlighted, showId, replyTarget, page, canRewind }) {
+function renderRewindEditor(editor, busy) {
+  const messageId = Number(editor.messageId);
+  return `<form class="rewind-editor" data-form="rewind-chat" data-message-id="${messageId}">
+    <textarea name="edited_content" aria-label="编辑这条消息" aria-describedby="rewind-note-${messageId}"
+      maxlength="20000" required ${busy ? 'disabled' : ''}>${esc(editor.content)}</textarea>
+    <div class="rewind-editor-footer">
+      <p id="rewind-note-${messageId}" class="small muted">保存后，后续消息会撤回，群友会从这里重新接话。</p>
+      <div class="button-row">
+        ${button('取消', 'cancel-rewind', busy ? 'disabled' : '')}
+        <button class="btn primary" type="submit" ${busy ? 'disabled' : ''}>保存并重跑</button>
+      </div>
+    </div>
+  </form>`;
+}
+
+function renderMessage(message, { highlighted, showId, replyTarget, page, canRewind, editor, busy }) {
   const user = message.role === 'user';
   const speaker = user ? '我' : message.bot_name || '机器人';
   const voice = user ? 'user' : speakerVoices.get(speaker) ?? 'default';
@@ -180,38 +197,52 @@ function renderMessage(message, { highlighted, showId, replyTarget, page, canRew
     ${showId && message.channel === 'aside' ? '<span class="tag">交头接耳</span>' : ''}
     ${showId ? '<span class="message-number">#' + message.id + '</span>' : ''}
     <time datetime="${esc(message.created_at)}">${esc(formatDate(message.created_at))}</time>${rewind}</div>
-    <div class="message-text">${esc(message.content)}</div>
+    ${editor ? renderRewindEditor(editor, busy) : '<div class="message-text">' + esc(message.content) + '</div>'}
     ${thought}${refs ? '<div class="references">' + refs + '</div>' : ''}${attribution}</article>`;
 }
 
-function renderThread(messages, page, canRewind = false, allMessages = messages) {
+function renderThread(messages, page, { canRewind, editor, busy } = {}, allMessages = messages) {
   const byId = new Map(allMessages.map(message => [message.id, message]));
   return messages.map(message => renderMessage(message, {
     page,
     canRewind,
+    editor: editor?.messageId === message.id ? editor : null,
+    busy,
     highlighted: message.id === state.route.message,
     showId: page === 'memory',
     replyTarget: byId.get(message.reply_to),
   })).join('');
 }
 
+function isChatWaiting(detail) {
+  return state.pending.has(detail?.session.id ?? 'new') || Boolean(detail?.chat_active);
+}
+
+function isComposerLocked(detail) {
+  return isChatWaiting(detail) || state.rewindEditors.has(detail?.session.id);
+}
+
+function canStartRewind(detail) {
+  const session = detail?.session;
+  return session && !session.archived && !isComposerLocked(detail) && !state.summaryJobs.has(session.id);
+}
+
 function renderChatFeed(detail) {
   const session = detail?.session;
   const draftKey = session?.id ?? 'new';
-  const pending = state.pending.get(draftKey);
-  const rewinding = state.rewindJobs.has(draftKey);
+  const busy = isChatWaiting(detail);
+  const editor = state.rewindEditors.get(draftKey);
   const messages = detail?.messages ?? [];
   const publicMessages = messages.filter(message => message.channel !== 'aside');
   const chatErrors = state.chatErrors.get(draftKey) ?? [];
-  const canRewind = session && !session.archived && !pending && !rewinding && !state.summaryJobs.has(session.id);
-  const thread = publicMessages.length ? '<div class="thread">' + renderThread(publicMessages, 'chat', canRewind, messages) + '</div>'
+  const canRewind = canStartRewind(detail);
+  const thread = publicMessages.length ? '<div class="thread">' + renderThread(publicMessages, 'chat', { canRewind, editor, busy }, messages) + '</div>'
     : `<section class="chat-empty">
       <div class="chat-empty-copy"><h2>你今天在想什么？</h2><p>半句话也可以发。</p></div>
       <figure class="chat-cover"><img src="/static/images/window-notebook.jpg" alt="" width="1536" height="1024" decoding="async"></figure>
     </section>`;
   return `${thread}
-    ${pending ? '<p class="status-text" role="status">正在等群友接话…</p>' : ''}
-    ${rewinding ? '<p class="status-text" role="status">正在回退对话…</p>' : ''}
+    ${busy ? '<p class="status-text" role="status">正在等群友接话…</p>' : ''}
     ${chatErrors.length ? '<div class="inline-error" role="alert">' + chatErrors.map(item =>
       '<p>' + esc([item.bot_name, item.detail].filter(Boolean).join(' · ')) + '</p>').join('') + '</div>' : ''}`;
 }
@@ -224,7 +255,9 @@ function renderChatSide(detail) {
   const targets = turn ? messages.filter(message => message.id === turn.id || message.turn_id === turn.id) : [];
   const target = targets.find(message => message.id === state.sideTargetId)
     ?? targets.findLast(message => message.channel !== 'aside');
-  const busy = session && (state.pending.has(session.id) || state.rewindJobs.has(session.id) || state.sideJobs.has(session.id));
+  const locked = isComposerLocked(detail);
+  const sidePending = state.sideJobs.has(session?.id);
+  const busy = isChatWaiting(detail) || sidePending;
   const guests = enabledBots().filter(bot => bot.id !== target?.bot_id);
   const canInvite = session && !session.archived && target && enabledBots().length;
   const canStop = session && !session.archived && detail.side_active;
@@ -232,11 +265,13 @@ function renderChatSide(detail) {
     <h2 id="chat-side-heading">交头接耳</h2>
     ${comments.length ? '<span class="small muted">' + comments.length + ' 条</span>' : ''}
   </div>
-  ${comments.length ? '<div class="thread side-thread">' + renderThread(comments, 'chat', false, messages) + '</div>'
-    : !detail?.side_active ? '<p class="chat-side-empty">群友接彼此的话会出现在这里。</p>' : ''}
-  ${detail?.side_active ? '<p class="status-text side-status" role="status">群友正在交谈，你可以随时发新消息。</p>' : ''}
+  ${comments.length ? '<div class="thread side-thread">' + renderThread(comments, 'chat', {}, messages) + '</div>'
+    : !detail?.side_active && !sidePending && !detail?.side_error ? '<p class="chat-side-empty">受邀角色的回复会出现在这里。</p>' : ''}
+  ${sidePending ? '<p class="status-text side-status" role="status">正在处理侧栏请求…</p>'
+    : detail?.side_active ? `<p class="status-text side-status" role="status">群友正在接话。${locked ? '' : '你可以随时发新消息。'}</p>`
+    : detail?.side_error ? '<p class="inline-error" role="alert">这次接话没完成，可以再邀请一次。</p>' : ''}
   ${canInvite || canStop ? `<div class="side-tools">
-    ${canInvite && targets.length > 1 ? `<label class="side-target-label">接哪句话
+    ${canInvite ? `<label class="side-target-label">接哪句话
       <select name="side-target" aria-label="接哪句话" ${busy || detail.side_active ? 'disabled' : ''}>
         ${targets.map(m => `<option value="${Number(m.id)}" ${m.id === target.id ? 'selected' : ''}>${esc(m.bot_name || '我')} · ${esc(m.content.slice(0, 32))}</option>`).join('')}
       </select></label>` : ''}
@@ -251,7 +286,7 @@ function renderChat() {
   const detail = state.detail;
   const session = detail?.session;
   const draftKey = session?.id ?? 'new';
-  const busy = state.pending.has(draftKey) || state.rewindJobs.has(draftKey);
+  const locked = isComposerLocked(detail);
   const bots = enabledBots();
   const mirror = bots.find(bot => bot.role_mode === 'mirror');
   const actions = session ? `<a class="btn" href="${href('memory', session.id)}">会话记忆</a>` : '';
@@ -262,17 +297,19 @@ function renderChat() {
     ${session?.archived ? `<div class="composer-wrap"><div class="composer archive-notice">
       <span>该会话已归档。</span><a class="btn" href="${href('memory', session.id)}">到会话记忆恢复</a>
     </div></div>` : `<div class="composer-wrap"><form class="composer" data-form="chat">
-      <textarea name="content" maxlength="20000" placeholder="写下一个想法…" aria-label="你的想法" required ${busy ? 'disabled' : ''}>${esc(state.drafts.get(draftKey) || '')}</textarea>
-      <div class="composer-footer">
-        <div class="composer-tools">${bots.length ?
-          `<select name="mention" class="mention-select" aria-label="点名机器人" ${busy ? 'disabled' : ''}>
-            <option value="">@ 点名</option>${bots.map(bot => `<option value="${Number(bot.id)}">${esc(bot.name)}</option>`).join('')}
-          </select>` : '<a class="btn" href="#ops/bots">去配置机器人</a>'}</div>
-        <div class="button-row">
-          ${mirror ? button('问' + esc(mirror.name), 'mention-mirror', 'data-bot-id="' + Number(mirror.id) + '"' + (busy ? ' disabled' : ''), 'text') : ''}
-          <button class="btn primary composer-send" type="submit" ${busy ? 'disabled' : ''}>发送</button>
+      <fieldset ${locked ? 'disabled' : ''}>
+        <textarea name="content" maxlength="20000" placeholder="写下一个想法…" aria-label="你的想法" required>${esc(state.drafts.get(draftKey) || '')}</textarea>
+        <div class="composer-footer">
+          <div class="composer-tools">${bots.length ?
+            `<select name="mention" class="mention-select" aria-label="点名机器人">
+              <option value="">@ 点名</option>${bots.map(bot => `<option value="${Number(bot.id)}">${esc(bot.name)}</option>`).join('')}
+            </select>` : '<a class="btn" href="#ops/bots">去配置机器人</a>'}</div>
+          <div class="button-row">
+            ${mirror ? button('问' + esc(mirror.name), 'mention-mirror', 'data-bot-id="' + Number(mirror.id) + '"', 'text') : ''}
+            <button class="btn primary composer-send" type="submit">发送</button>
+          </div>
         </div>
-      </div>
+      </fieldset>
     </form></div>`}
     </div></div>`;
 }
@@ -338,7 +375,6 @@ function renderMemory() {
     <section class="card empty-card"><h2>还没有打开会话</h2><p>选择一场会话查看原话和总结。</p><a href="#chat/new" class="btn primary">新对话</a></section></div>`;
   const { session, messages, summary } = detail;
   const pending = state.summaryJobs.has(session.id);
-  const rewinding = state.rewindJobs.has(session.id);
   const enabled = state.config.models.filter(model => model.enabled);
   const remembered = state.summaryModels.get(session.id) ?? state.config.summary_model_id ?? summary?.model_id;
   const chosen = enabled.find(model => model.id === remembered)?.id;
@@ -353,9 +389,9 @@ function renderMemory() {
       <label class="checkbox-field memory-toggle"><input type="checkbox" name="share-memory" ${session.summary_share_enabled !== false ? 'checked' : ''}>
       总结和观察切片可供其他会话引用</label>
       <form class="memory-controls" data-form="generate-summary">
-        <label class="field"><span>总结模型</span><select name="model_id" ${!enabled.length || pending || rewinding ? 'disabled' : ''}>
+        <label class="field"><span>总结模型</span><select name="model_id" ${!enabled.length || pending ? 'disabled' : ''}>
         ${enabled.length ? modelOptions(chosen, enabled) : '<option>请先启用模型</option>'}</select></label>
-        <button type="submit" class="btn primary" ${!enabled.length || !messages.length || pending || rewinding ? 'disabled' : ''}>${pending ? '正在生成…' : summary ? '重新生成' : '生成总结'}</button>
+        <button type="submit" class="btn primary" ${!enabled.length || !messages.length || pending ? 'disabled' : ''}>${pending ? '正在生成…' : summary ? '重新生成' : '生成总结'}</button>
       </form>
       ${summaryCard(summary, session.id)}
     </section>
@@ -426,7 +462,8 @@ const outcomeLabels = {
 };
 const taskLabels = {
   route: '路由', reply: '主聊', aside_route: '侧栏路由', aside: '侧栏接话',
-  observe: '观察器', summary: '总结', test: '连接测试', health: '连接测试',
+  reply_retry: '重答', reply_repair: '格式修正',
+  observe: '观察器', summary: '总结', test: '连接测试', health: '模型调用测试', web_search_test: '手动搜索',
 };
 const numberFormat = new Intl.NumberFormat('zh-CN');
 
@@ -438,11 +475,12 @@ function latency(value) {
   return typeof value === 'number' && Number.isFinite(value) ? count(Math.round(value)) + ' ms' : '—';
 }
 
-function monitorQuery() {
+function monitorQuery(tab) {
   const filters = new URLSearchParams();
   for (const [name, value] of Object.entries(state.monitorFilters)) {
     if (value) filters.set(name, value);
   }
+  if (tab === 'web') filters.set('web_only', 'true');
   return '/monitor?' + filters;
 }
 
@@ -494,7 +532,8 @@ function renderUsageMetrics(data) {
     ${renderMonitorTable('最近调用', ['时间', 'API / 模型', '用途', '结果', '耗时', '报告的 Token'],
       recent.map(row => `<tr><td><time datetime="${esc(row.created_at)}">${esc(formatDate(row.created_at))}</time></td>
         <td>${monitorSource(row)}</td><td>${esc(taskLabels[row.task] ?? row.task ?? '调用')}
-        ${row.bot_name ? '<span class="monitor-extra">' + esc(row.bot_name) + '</span>' : ''}</td>
+        ${row.bot_name ? '<span class="monitor-extra">' + esc(row.bot_name) + '</span>' : ''}
+        ${row.web_enabled ? `<span class="monitor-extra">${webCounts(row)}</span>` : ''}</td>
         <td>${monitorStatus(row.outcome)}</td><td>${latency(row.latency_ms)}</td><td>${count(row.total_tokens)}</td></tr>`), '没有符合筛选条件的调用。')}`;
 }
 
@@ -514,11 +553,143 @@ function renderAlerts(data) {
   }).join('') : '<section class="card monitor-section"><p>这个时间范围没有 API 告警。</p></section>';
 }
 
+function webCounts(record) {
+  if (record.calls === 0) return '搜索 0 次 · 读页 0 次';
+  if (record.search_count == null && record.read_count == null) return '用量未知';
+  return `搜索 ${count(record.search_count)} 次 · 读页 ${count(record.read_count)} 次`;
+}
+
+function renderWebSearch(data) {
+  const experts = state.config.bots.filter(bot => bot.can_web_search);
+  const job = state.webSearch;
+  const result = job.result;
+  return `<section class="card monitor-section"><h2>通过专家联网查询</h2>
+    <p class="status-text">聊天时，点名专家或由路由选中专家后，DeepSeek 会根据问题决定是否搜索。提供网页链接时，也可按需读取。普通群友不调用这两个工具。</p>
+    <p class="small muted wrap">本地接口 <code>POST /api/config/bots/{bot_id}/web-search</code></p>
+    <p class="small muted wrap">上游接口 <code>POST https://api.deepseek.com/anthropic/v1/messages</code></p>
+    ${experts.length ? `<form class="form-grid" data-form="web-search">
+      ${selectField('专家', 'bot_id', experts, Number(job.botId) || experts[0].id)}
+      ${textareaField('搜索问题或网页链接', 'query', job.query, 'required maxlength="3000" rows="2"')}
+      <div><button class="btn primary" type="submit" ${job.busy ? 'disabled' : ''}>${job.busy ? '查询中…' : '联网查询'}</button></div>
+    </form>` : '<p>请在「机器人」启用专家，并为其配置有密钥的官方 DeepSeek Flash 模型。</p>'}
+    ${job.error ? `<p class="inline-error" role="alert">${esc(job.error)}</p>` : ''}
+    ${result ? `<p class="small">${webCounts(result)}</p><div class="message-text">${esc(result.answer)}</div>
+      ${result.sources.map(source => `<p><a href="${esc(source.url)}" target="_blank" rel="noreferrer">${esc(source.title)}</a></p>`).join('')}` : ''}
+    </section>
+    <section class="card"><h2>工具用量</h2><p>${count(data.totals.calls)} 次可联网请求 · ${webCounts(data.totals)}</p>
+    <p class="small muted">总数只累计有回执的用量。每次请求中，零次表示未使用，未知表示缺少回执。工具用量从本次更新开始记录。</p></section>
+    ${renderMonitorTable('可联网请求', ['时间', '专家', '用途', '工具用量', '请求结果', '请求耗时'],
+       data.recent.map(row => `<tr><td>${esc(formatDate(row.created_at))}</td><td>${esc(row.bot_name)}</td>
+         <td>${esc(taskLabels[row.task] || row.task)}</td><td>${webCounts(row)}</td>
+         <td>${monitorStatus(row.outcome)}</td><td>${latency(row.latency_ms)}</td></tr>`), '当前筛选条件下还没有可联网请求。')}`;
+}
+
+async function submitWebSearch(form) {
+  const job = state.webSearch;
+  if (job.busy) return;
+  job.query = form.elements.query.value.trim();
+  if (!job.query) return;
+  job.botId = form.elements.bot_id.value;
+  Object.assign(job, { busy: true, result: null, error: '' });
+  render();
+  try {
+    job.result = await api('/config/bots/' + job.botId + '/web-search', 'POST', { query: job.query });
+  } catch (error) {
+    job.error = error.message;
+  } finally {
+    job.busy = false;
+    if (state.route.page === 'ops' && state.route.tab === 'web') await load({ keepScroll: true });
+  }
+}
+
 function renderMonitor(tab) {
-  const content = tab === 'alerts' ? renderAlerts(state.monitor) : renderUsageMetrics(state.monitor);
+  const views = { alerts: renderAlerts, web: renderWebSearch, monitor: renderUsageMetrics };
+  const content = views[tab](state.monitor);
   return header(monitorTabs[tab], button('刷新', 'reload')) + `<div class="page-body">
     ${renderOpsTabs(tab)}${renderMonitorFilters()}
     <div class="cards monitor-stack">${content}</div></div>`;
+}
+
+function renderReplyModels() {
+  const models = state.config.models.filter(model => model.enabled);
+  const selector = (label, key, defaultLabel) => formField(label, `<select name="${key}">
+    <option value="">${defaultLabel}</option>
+    ${models.map(model => `<option value="${Number(model.id)}" ${state.config[key] === model.id ? 'selected' : ''}>
+      ${esc(model.name)} · ${esc(configName('providers', model.provider_id))}</option>`).join('')}
+    </select>`);
+  return `<section class="card"><h2>路由与回退</h2>
+    <form data-form="reply-models">
+      <fieldset class="reply-model-fields">
+        <div>${selector('路由模型', 'router_model_id', '自动选择')}
+          <p class="small muted">分发主聊和侧栏接话，需要重答时替原角色重新生成。</p></div>
+        <div>${selector('回退模型', 'fallback_model_id', '不启用')}
+          <p class="small muted">回复格式不合规时，尝试修正 JSON。</p></div>
+        <button type="submit" class="btn primary">保存设置</button>
+      </fieldset>
+    </form></section>`;
+}
+
+function renderModelTestResult(result) {
+  if (!result || result.pending) return '';
+  const metrics = [
+    ['耗时', latency(result.latency_ms), result.latency_ms],
+    ['HTTP', result.http_status, result.http_status],
+    ['输入 Token', count(result.input_tokens), result.input_tokens],
+    ['输出 Token', count(result.output_tokens), result.output_tokens],
+    ['总 Token', count(result.total_tokens), result.total_tokens],
+  ];
+  return `${monitorStatus(result.outcome)}
+    ${metrics.filter(([, , value]) => typeof value === 'number').map(([label, value]) => `<span>${label} ${value}</span>`).join('')}
+    ${!result.ok && result.message ? '<p class="model-test-error">' + esc(result.message) + '</p>' : ''}`;
+}
+
+function renderModelTestButton(id) {
+  const pending = state.modelTests.get(id)?.pending;
+  return button(pending ? '测试中…' : '测试调用', 'test-model',
+    `data-id="${Number(id)}"${pending ? ' disabled aria-busy="true"' : ''}`);
+}
+
+async function testModel(id) {
+  if (state.modelTests.get(id)?.pending) return;
+  const pending = { pending: true };
+  const update = result => {
+    state.modelTests.set(id, result);
+    if (state.route.page !== 'ops' || state.route.tab !== 'models') return;
+    const control = main.querySelector(`[data-action="test-model"][data-id="${id}"]`);
+    if (!control) return;
+    control.disabled = Boolean(result.pending);
+    control.textContent = result.pending ? '测试中…' : '测试调用';
+    if (result.pending) control.setAttribute('aria-busy', 'true');
+    else control.removeAttribute('aria-busy');
+    control.closest('.ops-card').querySelector('[data-model-test-result]').innerHTML = renderModelTestResult(result);
+  };
+  update(pending);
+  let result;
+  try {
+    result = await api('/config/models/' + id + '/test', 'POST');
+  } catch (error) {
+    result = { ok: false, outcome: 'upstream', message: error.message };
+  }
+  if (state.modelTests.get(id) === pending) update(result);
+}
+
+async function saveReplyModels(form) {
+  const fields = form.querySelector('fieldset');
+  if (fields.disabled) return;
+  const body = Object.fromEntries([...new FormData(form)].map(([key, value]) => [key, value ? Number(value) : null]));
+  fields.disabled = true;
+  try {
+    const settings = await api('/config/reply-models', 'PATCH', body);
+    Object.assign(state.config, settings);
+    if (form.isConnected) {
+      for (const [key, id] of Object.entries(settings)) form.elements[key].value = id ?? '';
+      flash('已保存路由与回退模型');
+    }
+  } catch (error) {
+    flash(error.message, true);
+  } finally {
+    fields.disabled = false;
+  }
 }
 
 function renderOps() {
@@ -531,11 +702,12 @@ function renderOps() {
   const collection = collections[tab];
   const items = state.config[tab];
   const cards = items.map(item => `<article class="card ops-card">
-    <div><h2>${esc(item.name)}</h2><p class="small muted wrap">${configDescription(tab, item).map(esc).join(' · ')}</p></div>
+    <div><h2>${esc(item.name)}</h2><p class="small muted wrap">${configDescription(tab, item).map(esc).join(' · ')}</p>
+      ${tab === 'models' ? `<div class="model-test-result small" role="status" data-model-test-result>${renderModelTestResult(state.modelTests.get(item.id))}</div>` : ''}</div>
     <div class="button-row">
       ${tab === 'bots' ? `<label class="checkbox-field"><input type="checkbox" name="bot-enabled" data-bot-id="${Number(item.id)}"
         aria-label="启用${esc(item.name)}" ${item.enabled ? 'checked' : ''}>启用</label>` : ''}
-      ${tab === 'providers' ? button('测试连接', 'test-provider', 'data-id="' + item.id + '"') : ''}
+      ${tab === 'models' ? renderModelTestButton(item.id) : ''}
       ${button('编辑', 'edit-config', 'data-id="' + item.id + '"')}
       ${tab === 'bots' ? (item.role_mode === 'mirror'
         ? '<a class="btn" href="#memory">查看观察切片</a>'
@@ -549,7 +721,7 @@ function renderOps() {
     <div class="cards">${tab === 'bots' ? `<section class="card">
       ${checkboxField('长回答', 'long-replies', state.config.long_replies)}
       <p class="status-text">默认按话题调整长短。开启后，主聊和交头接耳都会更充分地展开观点。</p>
-    </section>` : ''}${cards || '<section class="card empty-card"><h2>还没有' + collection.item + '</h2><p>' + collection.empty + '</p>' + button('添加' + collection.item, 'add-config', '', 'primary') + '</section>'}</div></div>`;
+    </section>` : tab === 'models' ? renderReplyModels() : ''}${cards || '<section class="card empty-card"><h2>还没有' + collection.item + '</h2><p>' + collection.empty + '</p>' + button('添加' + collection.item, 'add-config', '', 'primary') + '</section>'}</div></div>`;
 }
 
 function render() {
@@ -581,7 +753,7 @@ async function load({ keepScroll = false } = {}) {
     const [detail, evolution, monitor] = await Promise.all([
       route.page !== 'ops' && route.id ? api('/sessions/' + route.id) : null,
       route.botId && config.bots.some(bot => bot.id === route.botId) ? api('/config/bots/' + route.botId + '/evolution') : null,
-      route.page === 'ops' && Object.hasOwn(monitorTabs, route.tab) ? api(monitorQuery()) : null,
+      route.page === 'ops' && Object.hasOwn(monitorTabs, route.tab) ? api(monitorQuery(route.tab)) : null,
     ]);
     if (loadId !== state.loadId) return;
     state.config = config;
@@ -589,8 +761,9 @@ async function load({ keepScroll = false } = {}) {
     state.detail = detail ?? null;
     state.evolution = evolution;
     state.monitor = monitor;
+    reconcileRewindEditor(detail);
     if (route.page === 'chat' && typeof detail?.rewind_draft === 'string'
-        && !state.drafts.has(route.id) && !state.pending.has(route.id) && !state.rewindJobs.has(route.id)) {
+        && !state.drafts.has(route.id) && !isChatWaiting(detail)) {
       state.drafts.set(route.id, detail.rewind_draft);
     }
     state.failed = '';
@@ -701,6 +874,12 @@ function showConfigEditor(tab, item, copy = false) {
     if (tab === 'bots' || tab === 'models') body.enabled = data.has('enabled');
     if (tab === 'providers' && !body.api_key.trim()) delete body.api_key;
     await api('/config/' + tab + (editing ? '/' + item.id : ''), editing ? 'PATCH' : 'POST', body);
+    if (editing && tab === 'models') state.modelTests.delete(item.id);
+    if (editing && tab === 'providers') {
+      for (const model of state.config.models) {
+        if (model.provider_id === item.id) state.modelTests.delete(model.id);
+      }
+    }
     await load({ keepScroll: true });
   });
   if (tab === 'bots') {
@@ -780,6 +959,36 @@ function isViewing(sessionId, page) {
   return state.route?.id === sessionId && (!page || state.route.page === page);
 }
 
+function reconcileRewindEditor(detail) {
+  if (!detail) return;
+  const id = detail.session.id;
+  const editor = state.rewindEditors.get(id);
+  if (editor && (detail.session.archived || !detail.messages.some(message => message.id === editor.messageId))) {
+    state.rewindEditors.delete(id);
+  }
+}
+
+function updateChatFeed() {
+  const feed = main.querySelector('#chat-feed');
+  if (!feed) return;
+  const active = document.activeElement;
+  const editing = feed.contains(active) && active.name === 'edited_content';
+  const selection = editing && [active.selectionStart, active.selectionEnd, active.selectionDirection];
+  const scrollTop = editing && active.scrollTop;
+  feed.innerHTML = renderChatFeed(state.detail);
+  if (selection) {
+    const input = feed.querySelector('[name="edited_content"]:enabled');
+    input?.focus({ preventScroll: true });
+    input?.setSelectionRange(...selection);
+    if (input) input.scrollTop = scrollTop;
+  }
+}
+
+function updateComposerLock() {
+  const fields = main.querySelector('[data-form="chat"] fieldset');
+  if (fields) fields.disabled = isComposerLocked(state.detail);
+}
+
 function updateSidePanel() {
   const panel = main.querySelector('#chat-side');
   if (!panel) return;
@@ -796,22 +1005,24 @@ async function refreshConversation(sessionId) {
   const page = state.route?.page;
   try {
     const detail = await api('/sessions/' + sessionId);
-    if (loadId !== state.loadId || !isViewing(sessionId, page) || state.rewindJobs.has(sessionId)) return;
+    if (loadId !== state.loadId || !isViewing(sessionId, page)) return;
     const previous = state.detail;
     state.detail = detail;
+    reconcileRewindEditor(detail);
     if (page === 'chat') {
       const oldMessages = previous?.messages ?? [];
       const visible = message => message.channel !== 'aside';
       const mainChanged = detail.messages.findLast(visible)?.id !== oldMessages.findLast(visible)?.id;
-      if (mainChanged) {
-        const feed = main.querySelector('#chat-feed');
+      const waitingChanged = detail.chat_active !== previous?.chat_active;
+      if (mainChanged || waitingChanged) {
         const nearBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 150;
-        feed.innerHTML = renderChatFeed(detail);
-        if (nearBottom) window.scrollTo(0, document.body.scrollHeight);
+        updateChatFeed();
+        updateComposerLock();
+        if (nearBottom && !state.rewindEditors.has(sessionId)) window.scrollTo(0, document.body.scrollHeight);
       }
       const messagesChanged = detail.messages.length !== oldMessages.length
         || detail.messages.at(-1)?.id !== oldMessages.at(-1)?.id;
-      if (messagesChanged || detail.side_active !== previous?.side_active || detail.side_error !== previous?.side_error) {
+      if (messagesChanged || waitingChanged || detail.side_active !== previous?.side_active || detail.side_error !== previous?.side_error) {
         updateSidePanel();
       }
     } else if (page === 'memory') {
@@ -827,7 +1038,7 @@ function schedulePoll() {
   clearTimeout(state.pollTimer);
   const { id, page } = state.route ?? {};
   const shouldPoll = page === 'chat'
-    ? state.pending.has(id) || state.sideJobs.has(id) || state.detail?.side_active
+    ? isChatWaiting(state.detail) || state.sideJobs.has(id) || state.detail?.side_active
     : page === 'memory' && state.detail?.observer_pending;
   if (!id || !shouldPoll) return;
   const loadId = state.loadId;
@@ -838,17 +1049,26 @@ function schedulePoll() {
 }
 
 async function sendChat(form) {
-  const content = form.elements.content.value.trim();
-  const session = state.detail?.session;
+  const rewindMessageId = form.dataset.form === 'rewind-chat' ? Number(form.dataset.messageId) : null;
+  const draft = (rewindMessageId ? form.elements.edited_content : form.elements.content).value;
+  const content = draft.trim();
+  const detail = state.detail;
+  const session = detail?.session;
   let sessionId = session?.id;
   let draftKey = sessionId ?? 'new';
-  if (!content || state.pending.has(draftKey) || state.rewindJobs.has(draftKey)) return;
+  if (!content || session?.archived || isChatWaiting(detail)) return;
+  const editor = state.rewindEditors.get(sessionId);
+  if (rewindMessageId ? editor?.messageId !== rewindMessageId || state.summaryJobs.has(sessionId) : editor) return;
   const previousHash = location.hash;
   state.pending.set(draftKey, true);
   state.chatErrors.delete(draftKey);
-  render();
+  if (editor) editor.content = draft;
+  updateChatFeed();
+  updateComposerLock();
+  updateSidePanel();
   schedulePoll();
 
+  let saved = false;
   try {
     if (!sessionId) {
       const created = await api('/sessions', 'POST', {});
@@ -859,25 +1079,36 @@ async function sendChat(form) {
       state.pending.set(draftKey, true);
       if (location.hash === previousHash) go('chat', sessionId);
     }
-    state.drafts.delete(draftKey);
-    const response = await api('/sessions/' + sessionId + '/chat', 'POST', { content });
+    if (!rewindMessageId) state.drafts.delete(draftKey);
+    const body = rewindMessageId ? { content, rewind_message_id: rewindMessageId } : { content };
+    const response = await api('/sessions/' + sessionId + '/chat', 'POST', body);
+    saved = true;
+    if (rewindMessageId) {
+      state.rewindEditors.delete(sessionId);
+      if (isViewing(sessionId, 'chat') && state.route.message) history.replaceState(null, '', href('chat', sessionId));
+    }
     if (response.errors?.length) {
       state.chatErrors.set(sessionId, response.errors);
     } else if (!response.messages?.some(message => message.role === 'assistant') && isViewing(sessionId, 'chat')) {
       flash('已记下');
     }
   } catch (error) {
-    state.drafts.set(draftKey, content);
+    if (!rewindMessageId) state.drafts.set(draftKey, draft);
     state.chatErrors.set(draftKey, [{ detail: error.message }]);
     flash(error.message, true);
   } finally {
     state.pending.delete(draftKey);
-    if (isViewing(sessionId, 'chat') || (!sessionId && location.hash === previousHash)) await load();
+    if (isViewing(sessionId, 'chat') || (!sessionId && location.hash === previousHash)) {
+      await load({ keepScroll: Boolean(rewindMessageId && !saved) });
+      if (rewindMessageId && !saved && isViewing(sessionId, 'chat')) focusRewindEditor();
+    } else if (rewindMessageId && isViewing(sessionId, 'memory')) {
+      await load({ keepScroll: true });
+    }
   }
 }
 
 function insertMention(content, bot) {
-  if (!content || content.disabled || !bot) return;
+  if (!content || content.matches(':disabled') || !bot) return;
   const start = content.selectionStart;
   const separator = start > 0 && !/\s/.test(content.value[start - 1]) ? ' ' : '';
   const mention = separator + '@' + bot.name + ' ';
@@ -891,11 +1122,15 @@ function insertMention(content, bot) {
 }
 
 async function changeSide(sessionId, operation, body) {
-  if (!sessionId || state.rewindJobs.has(sessionId) || state.sideJobs.has(sessionId)) return;
+  if (!sessionId || isChatWaiting(state.detail) || state.sideJobs.has(sessionId)) return;
   state.sideJobs.add(sessionId);
   updateSidePanel();
   try {
     await api('/sessions/' + sessionId + '/side' + operation, 'POST', body);
+    if (operation === '' && isViewing(sessionId, 'chat') && state.detail?.session.id === sessionId) {
+      // Keep polling an admitted invitation even if the first detail fetch fails.
+      state.detail = { ...state.detail, side_active: true, side_error: null };
+    }
   } finally {
     state.sideJobs.delete(sessionId);
     if (isViewing(sessionId, 'chat')) {
@@ -910,7 +1145,7 @@ async function changeSide(sessionId, operation, body) {
 
 async function generateSummary(form) {
   const id = state.detail.session.id;
-  if (state.summaryJobs.has(id) || state.rewindJobs.has(id)) return;
+  if (state.summaryJobs.has(id)) return;
   const modelId = Number(new FormData(form).get('model_id'));
   if (modelId) state.summaryModels.set(id, modelId);
   state.summaryJobs.add(id);
@@ -926,41 +1161,35 @@ async function generateSummary(form) {
   }
 }
 
-async function rewindChat(session, messageId) {
-  const id = session?.id;
-  if (!id || session.archived || state.pending.has(id) || state.rewindJobs.has(id)
-      || state.summaryJobs.has(id) || !isViewing(id, 'chat')) return;
-  if (!state.detail.messages.some(message => message.id === messageId && message.role === 'user')) return;
-  const existingDraft = state.drafts.get(id)?.trim();
-  const warning = '这条消息和之后的消息会被删除。原文会放回输入框，供你编辑后重新发送。';
-  if (!confirm(warning + (existingDraft ? '\n\n当前输入框里的未发送草稿会被替换。' : ''))) return;
+function focusRewindEditor() {
+  const input = main.querySelector('[name="edited_content"]:enabled');
+  if (!input) return;
+  input.focus({ preventScroll: true });
+  input.setSelectionRange(input.value.length, input.value.length);
+  input.scrollIntoView({ block: 'nearest' });
+}
 
-  state.rewindJobs.add(id);
-  render();
-  let result;
-  try {
-    result = await api('/sessions/' + id + '/rewind', 'POST', { message_id: messageId });
-    state.drafts.set(id, result.draft);
-    state.chatErrors.delete(id);
-  } finally {
-    state.rewindJobs.delete(id);
-    const route = readRoute();
-    const staysHere = !route.fresh && (route.id ?? state.route?.id) === id;
-    if (route.page === 'chat' && staysHere) {
-      if (result) history.replaceState(null, '', href('chat', id));
-      await load({ keepScroll: !result });
-      if (result && isViewing(id, 'chat')) {
-        const composer = main.querySelector('[data-form="chat"] textarea[name="content"]');
-        if (composer) {
-          composer.focus();
-          composer.setSelectionRange(composer.value.length, composer.value.length);
-        }
-      }
-    } else if (route.page === 'memory' && staysHere) {
-      await load({ keepScroll: true });
-    }
-  }
-  flash('已回退 ' + result.removed_count + ' 条消息，原文已放回输入框。');
+function startRewind(messageId) {
+  const detail = state.detail;
+  if (state.route.page !== 'chat' || !canStartRewind(detail)) return;
+  const message = detail.messages.find(message => message.id === messageId && message.role === 'user');
+  if (!message) return;
+  state.rewindEditors.set(detail.session.id, { messageId, content: message.content });
+  updateChatFeed();
+  updateComposerLock();
+  updateSidePanel();
+  focusRewindEditor();
+}
+
+function cancelRewind() {
+  const id = state.detail?.session.id;
+  const editor = state.rewindEditors.get(id);
+  if (!editor || isChatWaiting(state.detail)) return;
+  state.rewindEditors.delete(id);
+  updateChatFeed();
+  updateComposerLock();
+  updateSidePanel();
+  main.querySelector(`#message-${editor.messageId} .message-rewind`)?.focus({ preventScroll: true });
 }
 
 async function dispatchAction(control) {
@@ -977,7 +1206,9 @@ async function dispatchAction(control) {
   } else if (action === 'stop-side') {
     await changeSide(session?.id, '/stop', {});
   } else if (action === 'rewind-chat') {
-    await rewindChat(session, Number(control.dataset.messageId));
+    startRewind(Number(control.dataset.messageId));
+  } else if (action === 'cancel-rewind') {
+    cancelRewind();
   } else if (action === 'reload') {
     await load();
   } else if (action === 'ack-alert') {
@@ -994,18 +1225,11 @@ async function dispatchAction(control) {
   } else if (action === 'delete-config') {
     if (!confirm('删除「' + item.name + '」？')) return;
     await api('/config/' + tab + '/' + item.id, 'DELETE');
+    if (tab === 'models') state.modelTests.delete(item.id);
     await load({ keepScroll: true });
     flash('配置已删除');
-  } else if (action === 'test-provider') {
-    control.disabled = true;
-    control.textContent = '测试中…';
-    try {
-      const result = await api('/config/providers/' + item.id + '/test', 'POST', {});
-      flash(result.message);
-    } finally {
-      control.disabled = false;
-      control.textContent = '测试连接';
-    }
+  } else if (action === 'test-model' && item) {
+    await testModel(item.id);
   } else if (action === 'rename-session') {
     dialog('重命名会话', textField('标题', 'title', session.title, 'maxlength="120" required'), async data => {
       await api(path, 'PATCH', { title: data.get('title') });
@@ -1051,12 +1275,18 @@ document.addEventListener('click', event => {
 
 document.addEventListener('submit', event => {
   const form = event.target;
-  if (form.dataset.form === 'chat') {
+  if (form.dataset.form === 'chat' || form.dataset.form === 'rewind-chat') {
     event.preventDefault();
     void sendChat(form);
+  } else if (form.dataset.form === 'web-search') {
+    event.preventDefault();
+    void submitWebSearch(form);
   } else if (form.dataset.form === 'generate-summary') {
     event.preventDefault();
     void generateSummary(form);
+  } else if (form.dataset.form === 'reply-models') {
+    event.preventDefault();
+    void saveReplyModels(form);
   }
 });
 
@@ -1067,6 +1297,9 @@ document.addEventListener('input', event => {
     sidebar.querySelector('#session-list').innerHTML = sessionLinks();
   } else if (input.name === 'content') {
     state.drafts.set(state.detail?.session.id ?? 'new', input.value);
+  } else if (input.name === 'edited_content') {
+    const editor = state.rewindEditors.get(state.detail?.session.id);
+    if (editor) editor.content = input.value;
   }
 });
 
@@ -1168,12 +1401,13 @@ document.addEventListener('toggle', event => {
 }, true);
 
 document.addEventListener('keydown', event => {
-  if (event.target.name !== 'content' || event.key !== 'Enter' || event.shiftKey
-      || event.isComposing || event.keyCode === 229) return;
+  if (event.key !== 'Enter' || event.shiftKey || event.isComposing || event.keyCode === 229) return;
+  const inlineSubmit = event.target.name === 'edited_content' && (event.metaKey || event.ctrlKey);
+  if (event.target.name !== 'content' && !inlineSubmit) return;
   const form = event.target.form;
   const submit = form.querySelector('button[type="submit"]');
   event.preventDefault();
-  if (!submit.disabled) form.requestSubmit(submit);
+  if (!submit.matches(':disabled')) form.requestSubmit(submit);
 });
 
 window.addEventListener('hashchange', () => {

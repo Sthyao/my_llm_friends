@@ -29,6 +29,7 @@ class ChatInput(Input):
     content: str = Field(min_length=1, max_length=20000)
     bot_ids: list[int] | None = Field(default=None, max_length=6)
     discuss: bool = False
+    rewind_message_id: int | None = Field(default=None, gt=0, strict=True)
 
 
 class InterjectInput(Input):
