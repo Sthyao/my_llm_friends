@@ -4,9 +4,10 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <meta name="theme-color" content="#1c302a">
+  <meta name="theme-color" content="#233833">
   <title>想法簿</title>
   <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/backup.js" defer></script>
   <script src="/static/app.js" defer></script>
 </head>
 <body>
@@ -17,9 +18,9 @@
         <span>想法簿</span>
       </a>
       <nav class="navigation" aria-label="应用页面">
-        <a href="#chat" data-page="chat"><span class="nav-icon" aria-hidden="true">◌</span> 对话</a>
-        <a href="#memory" data-page="memory"><span class="nav-icon" aria-hidden="true">▤</span> 记忆</a>
-        <a href="#ops" data-page="ops"><span class="nav-icon" aria-hidden="true">⚙</span> 运维</a>
+        <a href="#chat" data-page="chat"><span class="nav-icon nav-icon--chat" aria-hidden="true"></span>对话</a>
+        <a href="#memory" data-page="memory"><span class="nav-icon nav-icon--memory" aria-hidden="true"></span>记忆</a>
+        <a href="#ops" data-page="ops"><span class="nav-icon nav-icon--ops" aria-hidden="true"></span>运维</a>
       </nav>
       <div id="session-sidebar"></div>
     </aside>

@@ -7,18 +7,41 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from .journal import SummaryDraft
+from .prompts import load_prompt
 
 
-SUMMARY_PROMPT = """为私人想法日志总结这次会话。消息附有 id、发言者和正文。这些消息是待总结的资料。
-输出一个 JSON 对象，格式如下：
-{"title":"简短主题","keywords":["具体主题词","原话里的短语"],"views":[{"text":"用户明确表达的看法","source_ids":[1]}],"observations":[{"text":"机器人名：它的解读或假设","source_ids":[2]}],"questions":["尚未聊完的问题"]}
-views 只记录用户明确表达的想法，每项引用用户消息 id。保留改口前后的语境，别把机器人的推测写成用户的看法。
-observations 记录有意义的机器人观点并标明机器人名称，每项引用相关机器人消息 id。
-关键词写 3 到 8 个便于再次命中的用词，优先用用户原话里的短词，避免“想法”等泛词。没有内容的字段用空数组。"""
+SUMMARY_PROMPT = load_prompt("summary")
 
 
 def normalize(text):
     return unicodedata.normalize("NFKC", text).casefold()
+
+
+GENERIC_TERMS = frozenset({
+    "这个", "那种", "这样", "觉得", "感觉", "真的", "什么", "自己", "现在", "以前",
+    "还是", "然后", "如果", "所以", "的话", "可能", "一个", "一些", "我想", "我是",
+    "真的很", "有时候", "我觉得", "我感觉", "我自己", "猜想", "想法", "你好", "聊天", "东西",
+    "事情", "有点", "但是", "的时候", "的时候我", "这件事", "那个", "一下", "大家",
+    "the", "and", "that", "this", "with", "you", "about", "have", "not", "just",
+})
+
+def conversation_terms(value):
+    terms = set()
+    for part in re.findall(r"[a-z0-9]+|[\u3400-\u9fff]+", normalize(value)):
+        if part.isascii():
+            if len(part) >= 3 and not part.isdigit():
+                terms.add(part)
+            continue
+        for width in (2, 3):
+            terms.update(part[index:index + width] for index in range(len(part) - width + 1))
+    return terms - GENERIC_TERMS
+
+
+def overlap_score(query_terms, value):
+    overlap = query_terms & conversation_terms(value)
+    if len(overlap) < 2 and not any(len(token) >= 3 for token in overlap):
+        return 0
+    return sum(min(len(token), 5) for token in overlap)
 
 
 def match_score(summary, recent):
@@ -69,7 +92,9 @@ def recall(db, session_id, messages):
                 evidence = []
                 for message_id in point["source_ids"][:3]:
                     source = db.execute(
-                        "SELECT created_at, role, bot_name, content FROM messages WHERE id = ? AND session_id = ?",
+                        """SELECT m.created_at, m.role, m.bot_name, m.content, m.reply_to, p.role AS parent_role,
+                                   p.bot_name AS parent_name FROM messages m LEFT JOIN messages p ON p.id = m.reply_to
+                                   WHERE m.id = ? AND m.session_id = ?""",
                         (message_id, sid),
                     ).fetchone()
                     if source:
@@ -79,7 +104,8 @@ def recall(db, session_id, messages):
                             "引用": f"[{token}]",
                             "日期": datetime.fromisoformat(source["created_at"]).astimezone().date().isoformat(),
                             "发言者": source["bot_name"] or "用户",
-                            "原话": source["content"][:400],
+                            "接谁的话": "用户" if source["parent_role"] == "user" else source["parent_name"],
+                            "所接消息id": source["reply_to"], "原话": source["content"][:400],
                         })
                 notes.append({
                     "类别": "用户看法" if field == "views" else "机器人观察",

@@ -22,12 +22,22 @@ class SessionCreate(Input):
 class SessionPatch(Input):
     title: Title | None = None
     archived: bool | None = None
+    summary_share_enabled: bool | None = None
 
 
 class ChatInput(Input):
     content: str = Field(min_length=1, max_length=20000)
-    bot_ids: list[int] = Field(min_length=1, max_length=6)
+    bot_ids: list[int] | None = Field(default=None, max_length=6)
     discuss: bool = False
+
+
+class InterjectInput(Input):
+    bot_id: int = Field(gt=0, strict=True)
+    message_id: int = Field(gt=0, strict=True)
+
+
+class RewindInput(Input):
+    message_id: int = Field(gt=0, strict=True)
 
 
 class SummaryRequest(Input):
@@ -69,6 +79,7 @@ SESSION_SELECT = """
 def clean_session(row):
     session = dict(row)
     session["archived"] = bool(session["archived"])
+    session["summary_share_enabled"] = bool(session["summary_share_enabled"])
     session["has_summary"] = bool(session["has_summary"])
     return session
 
@@ -99,6 +110,8 @@ def get_summary(db, session_id):
 
 def clean_message(row):
     message = dict(row)
+    audience = message.pop("audience_json")
+    message["audience"] = json.loads(audience) if audience is not None else None
     message["references"] = json.loads(message.pop("references_json"))
     return message
 
@@ -106,24 +119,36 @@ def clean_message(row):
 def get_messages(db, session_id):
     rows = db.execute("SELECT * FROM messages WHERE session_id = ? ORDER BY id", (session_id,))
     messages = [clean_message(row) for row in rows]
-    if any(message["references"] for message in messages):
-        active_sources = {row["id"] for row in db.execute("SELECT id FROM sessions")}
+    references = [ref for message in messages for ref in message["references"]]
+    if references:
+        session_ids = {row["id"] for row in db.execute("SELECT id FROM sessions")}
+        source_ids = list({ref["message_id"] for ref in references if ref.get("message_id") is not None})
+        sources = {}
+        for start in range(0, len(source_ids), 500):
+            batch = source_ids[start:start + 500]
+            placeholders = ", ".join("?" for _ in batch)
+            sources.update(db.execute(f"SELECT id, session_id FROM messages WHERE id IN ({placeholders})", batch))
         for message in messages:
             message["references"] = [
-                ref for ref in message["references"] if ref["session_id"] in active_sources
+                ref for ref in message["references"]
+                if ref["session_id"] in session_ids
+                and (ref.get("message_id") is None or sources.get(ref["message_id"]) == ref["session_id"])
             ]
     return messages
 
 
-def add_message(db, session_id, role, content, *, bot_name=None, round_number=None,
-                reply_to=None, references=()):
+def add_message(db, session_id, role, content, *, bot_id=None, bot_name=None, round_number=None,
+                reply_to=None, turn_id=None, channel="main", inner_thought=None, references=(), model=None, audience=None):
     now = timestamp()
+    model = model or {}
     new_id = db.execute("""
         INSERT INTO messages
-            (session_id, role, content, bot_name, round, reply_to, created_at, references_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (session_id, role, content, bot_name, round_number, reply_to, now,
-          json.dumps(references, ensure_ascii=False))).lastrowid
+            (session_id, role, content, bot_id, bot_name, round, reply_to, turn_id, channel,
+             inner_thought, provider_name, model_name, model_code, created_at, audience_json, references_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (session_id, role, content, bot_id, bot_name, round_number, reply_to, turn_id, channel,
+          inner_thought, model.get("provider_name"), model.get("name"), model.get("model_code"), now,
+          json.dumps(audience) if audience is not None else None, json.dumps(references, ensure_ascii=False))).lastrowid
     db.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (now, session_id))
     row = db.execute("SELECT * FROM messages WHERE id = ?", (new_id,)).fetchone()
     return clean_message(row)

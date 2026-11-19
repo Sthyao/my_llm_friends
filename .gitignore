@@ -4,6 +4,7 @@
 *.sqlite
 *.sqlite3
 *.db
+*.thoughts-backup.zip
 *-wal
 *-shm
 *-journal
