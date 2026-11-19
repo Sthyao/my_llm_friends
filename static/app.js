@@ -533,6 +533,8 @@ function renderOps() {
   const cards = items.map(item => `<article class="card ops-card">
     <div><h2>${esc(item.name)}</h2><p class="small muted wrap">${configDescription(tab, item).map(esc).join(' · ')}</p></div>
     <div class="button-row">
+      ${tab === 'bots' ? `<label class="checkbox-field"><input type="checkbox" name="bot-enabled" data-bot-id="${Number(item.id)}"
+        aria-label="启用${esc(item.name)}" ${item.enabled ? 'checked' : ''}>启用</label>` : ''}
       ${tab === 'providers' ? button('测试连接', 'test-provider', 'data-id="' + item.id + '"') : ''}
       ${button('编辑', 'edit-config', 'data-id="' + item.id + '"')}
       ${tab === 'bots' ? (item.role_mode === 'mirror'
@@ -1096,6 +1098,18 @@ document.addEventListener('change', async event => {
     }
   } else if (input.name === 'model_id' && input.closest('[data-form="generate-summary"]')) {
     state.summaryModels.set(state.detail.session.id, Number(input.value));
+  } else if (input.name === 'bot-enabled') {
+    const enabled = input.checked;
+    input.disabled = true;
+    try {
+      await api('/config/bots/' + Number(input.dataset.botId), 'PATCH', { enabled });
+      await load({ keepScroll: true });
+    } catch (error) {
+      input.checked = !enabled;
+      flash(error.message, true);
+    } finally {
+      input.disabled = false;
+    }
   } else if (input.name === 'long-replies') {
     const enabled = input.checked;
     input.disabled = true;

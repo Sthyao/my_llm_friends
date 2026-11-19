@@ -25,6 +25,11 @@ PERSONAS = {
     MIRROR_NAME: load_prompt("personas/mirror"),
 }
 
+EXPERT_PERSONAS = {
+    "自我分析心理学专家": load_prompt("personas/psychology"),
+    "社会科学分析专家": load_prompt("personas/social-science"),
+}
+
 _PRIOR_STARTER_NAMES = {"浪漫": "造梦师", "客观": "刺头", "忧郁": "拾荒者"}
 _PRIOR_STARTER_HASHES = {
     "忧郁": {
@@ -150,6 +155,36 @@ def retire_starter_bot(conn, bot):
     """, (bot["persona_id"],))
 
 
+def seed_experts(conn):
+    if conn.execute("SELECT 1 FROM config_settings WHERE key = 'expert_personas_v1'").fetchone():
+        return
+    model = conn.execute("""
+        SELECT m.id FROM models m JOIN providers p ON p.id = m.provider_id
+        WHERE p.kind = 'deepseek' AND p.base_url IN (?, ?) AND m.model_code = 'deepseek-flash'
+        ORDER BY m.enabled DESC, m.id LIMIT 1
+    """, (DEEPSEEK_URL, DEEPSEEK_URL + "/v1")).fetchone()
+    if model is None:
+        provider = conn.execute(
+            "SELECT id FROM providers WHERE kind = 'deepseek' AND base_url = ? ORDER BY id LIMIT 1", (DEEPSEEK_URL,)
+        ).fetchone()
+        provider_id = provider["id"] if provider else conn.execute("""
+            INSERT INTO providers (name, base_url, kind, use_deepseek_env) VALUES ('DeepSeek', ?, 'deepseek', 1)
+        """, (DEEPSEEK_URL,)).lastrowid
+        model_id = conn.execute("""
+            INSERT INTO models (name, provider_id, model_code) VALUES ('DeepSeek Flash', ?, 'deepseek-flash')
+        """, (provider_id,)).lastrowid
+    else:
+        model_id = model["id"]
+    for name, prompt in EXPERT_PERSONAS.items():
+        if conn.execute("SELECT 1 FROM bots WHERE name = ?", (name,)).fetchone():
+            continue
+        persona_id = conn.execute(
+            "INSERT INTO personas (name, prompt, web_search) VALUES (?, ?, 1)", (name, prompt)
+        ).lastrowid
+        conn.execute("INSERT INTO bots (name, persona_id, model_id) VALUES (?, ?, ?)", (name, persona_id, model_id))
+    conn.execute("INSERT INTO config_settings (key, value) VALUES ('expert_personas_v1', '1')")
+
+
 def init_config(conn: sqlite3.Connection) -> None:
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS providers (
@@ -193,6 +228,8 @@ def init_config(conn: sqlite3.Connection) -> None:
             ALTER TABLE bots ADD COLUMN role_mode TEXT NOT NULL DEFAULT 'friend'
             CHECK(role_mode IN ('friend', 'mirror'))
         """)
+    if "web_search" not in {row["name"] for row in conn.execute("PRAGMA table_info(personas)")}:
+        conn.execute("ALTER TABLE personas ADD COLUMN web_search INTEGER NOT NULL DEFAULT 0 CHECK(web_search IN (0, 1))")
     seeded = conn.execute(
         "INSERT INTO config_settings (key, value) VALUES ('seeded', '1') ON CONFLICT DO NOTHING"
     )
@@ -200,6 +237,7 @@ def init_config(conn: sqlite3.Connection) -> None:
         refresh_builtin_personas(conn)
         refresh_friend_voices(conn)
         seed_poe(conn)
+        seed_experts(conn)
         return
 
     provider_id = conn.execute(
@@ -216,6 +254,7 @@ def init_config(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO config_settings (key, value) VALUES ('group_personas_v3', '1'), ('friend_voices_v4', '1')")
     set_summary_model_id(conn, model_id)
     seed_poe(conn)
+    seed_experts(conn)
 
 
 def seed_poe(conn):
@@ -280,7 +319,7 @@ def get_model(conn: sqlite3.Connection, model_id: int) -> dict:
 
 def get_bot(conn: sqlite3.Connection, bot_id: int) -> dict:
     bot = conn.execute(
-        """SELECT bots.*, personas.prompt
+        """SELECT bots.*, personas.prompt, personas.web_search
            FROM bots JOIN personas ON personas.id = bots.persona_id
            WHERE bots.id = ?""",
         (bot_id,),
@@ -292,7 +331,7 @@ def get_bot(conn: sqlite3.Connection, bot_id: int) -> dict:
     model = get_model(conn, bot["model_id"])
     return {
         **model, "bot_id": bot["id"], "bot_name": bot["name"], "prompt": bot["prompt"],
-        "role_mode": bot["role_mode"],
+        "role_mode": bot["role_mode"], "web_search": bool(bot["web_search"]),
     }
 
 

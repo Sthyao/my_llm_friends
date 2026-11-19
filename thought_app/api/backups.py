@@ -10,6 +10,7 @@ from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 from ..backup import MAX_UPLOAD_BYTES, BackupError, export_backup, read_backup, restore_backup
+from ..config import seed_experts
 from ..database import connect, database_path
 
 
@@ -57,6 +58,7 @@ def apply_backup(payload):
             archive.unlink(missing_ok=True)
             raise
         restored = restore_backup(db, payload)
+        seed_experts(db)
     return {"restored": restored, "safety_backup": archive.name}
 
 

@@ -28,7 +28,7 @@ _SEQUENCED = frozenset({
     "observer_observations", "api_usage_alerts", "api_usage_calls",
 })
 _PUBLIC_SETTINGS = (
-    "seeded", "poe_seeded", "group_personas_v3", "friend_voices_v4", "summary_model_id", "long_replies",
+    "seeded", "poe_seeded", "group_personas_v3", "friend_voices_v4", "expert_personas_v1", "summary_model_id", "long_replies",
 )
 
 
@@ -216,7 +216,10 @@ def _validate_rows(db, tables):
     for name, table in tables.items():
         current = _columns(db, name)
         columns = table["columns"]
-        if set(columns) != set(current):
+        expected = set(current)
+        if name == "personas" and "web_search" not in columns:
+            expected.remove("web_search")  # Earlier backups use the column default.
+        if set(columns) != expected:
             raise BackupError(f"备份表 {name} 与当前版本的字段不匹配。")
         definitions = [current[column] for column in columns]
         if name == "messages":

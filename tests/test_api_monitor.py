@@ -37,6 +37,7 @@ class ApiMonitorTests(unittest.TestCase):
             return real_async_client(*args, transport=httpx.MockTransport(self.respond), **kwargs)
 
         self.llm = llm
+        self.expert_response = None
         self.poe_response = self.normal_reply
         stack.enter_context(patch("thought_app.llm.httpx.AsyncClient", mocked_async_client))
         stack.enter_context(patch("thought_app.sides.SIDE_PROBABILITY", 0))
@@ -62,6 +63,10 @@ class ApiMonitorTests(unittest.TestCase):
             self.assertEqual(json.loads(request.content)["model"], "deepseek-v3.2")
             return self.poe_response(request)
         self.assertEqual(request.url.host, "api.deepseek.com")
+        if request.url.path == "/anthropic/v1/messages":
+            self.assertEqual(request.headers["x-api-key"], self.DEEPSEEK_KEY)
+            return self.expert_response(request)
+        self.assertNotIn("tools", json.loads(request.content))
         self.assertEqual(request.headers["Authorization"], f"Bearer {self.DEEPSEEK_KEY}")
         # The Observer can run alongside a direct request to another provider.
         return httpx.Response(200, json={
@@ -73,6 +78,31 @@ class ApiMonitorTests(unittest.TestCase):
 
     def health(self):
         return self.client.post(f"/api/config/providers/{self.poe['id']}/test", json={"model_id": self.model["id"]})
+
+    def test_experts_can_search_and_keep_provider_citations(self):
+        experts = [b for b in self.config["bots"] if b["name"].endswith("专家")]
+        self.assertEqual(len(experts), 2)
+        for bot, question, thinking in zip(experts, ["请查研究", "请读 https://example.org/study"], ["enabled", "disabled"]):
+            def expert_response(request):
+                payload = json.loads(request.content)
+                self.assertEqual(payload["thinking"]["type"], thinking)
+                self.assertEqual([t["name"] for t in payload["tools"]], ["deepseek_web_search", "deepseek_read_url"])
+                packet = json.loads(payload["messages"][0]["content"])
+                return httpx.Response(200, json={"stop_reason": "end_turn", "content": [
+                    {"type": "thinking", "thinking": "hidden"},
+                    {"type": "server_tool_use", "name": "deepseek_web_search"},
+                    {"type": "text", "text": json.dumps({"address": packet["本次发言"], "sources": [],
+                     "reply": "这项研究明确了样本的范围。"}), "citations": [{"title": "Study", "url": "https://example.org/study"}]},
+                ]})
+
+            self.expert_response = expert_response
+            sid = self.checked(self.client.post("/api/sessions", json={}))["id"]
+            result = self.checked(self.client.post(f"/api/sessions/{sid}/chat", json={"content": f"@{bot['name']} {question}"}))
+            self.assertEqual(result["errors"], [])
+            _, answer = result["messages"]
+            self.assertEqual(answer["bot_id"], bot["id"])
+            self.assertIn("https://example.org/study", answer["content"])
+            self.assertNotIn("hidden", answer["content"])
 
     def test_switching_a_bot_model_routes_its_reply_and_records_the_actual_provider(self):
         self.assertEqual(self.poe["base_url"], "https://api.poe.com/v1")
