@@ -130,8 +130,17 @@ h1, h2, h3, p { margin-top: 0; }
 .composer fieldset { min-inline-size: 0; padding: 0; margin: 0; border: 0; }
 .composer fieldset:disabled textarea { background: #eee7d9; }
 .composer textarea { min-height: 76px; max-height: 34dvh; border: 0; background: transparent; padding: 7px 8px; resize: vertical; font-size: 15px; line-height: 1.75; }
-.composer textarea:focus-visible { outline-offset: -2px; }
-.composer:focus-within { border-color: #9a8f6e; }
+.composer textarea:focus { outline: none; }
+.composer:has(textarea:focus) {
+  border-color: color-mix(in srgb, var(--accent) 70%, #cabc9f);
+  background-color: color-mix(in srgb, var(--soft-green) 22%, var(--surface));
+}
+@media (prefers-reduced-motion: no-preference) {
+  .composer { transition: border-color 160ms ease, background-color 160ms ease; }
+}
+@media (forced-colors: active) {
+  .composer:has(textarea:focus) { outline: 1px solid Highlight; outline-offset: 2px; }
+}
 .composer-footer { display: flex; justify-content: space-between; gap: 11px; align-items: flex-end; flex-wrap: wrap; margin-top: 8px; padding-top: 9px; border-top: 1px solid #e6dcc7; }
 .composer-tools { min-width: 0; }
 .checkbox-field input { width: auto; margin: 0; accent-color: var(--accent); }
