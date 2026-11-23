@@ -132,6 +132,7 @@ class ApiMonitorTests(unittest.TestCase):
         for bot, question, thinking in zip(experts, ["请查研究", "请读 https://example.org/study"], ["enabled", "disabled"]):
             def expert_response(request):
                 payload = json.loads(request.content)
+                self.assertNotIn("max_tokens", payload)
                 self.assertEqual(payload["thinking"]["type"], thinking)
                 self.assertEqual([t["name"] for t in payload["tools"]], ["deepseek_web_search", "deepseek_read_url"])
                 packet = json.loads(payload["messages"][0]["content"])
@@ -158,10 +159,14 @@ class ApiMonitorTests(unittest.TestCase):
         path = f"/api/config/bots/{bot['id']}/web-search"
         question = {"query": self.PRIVATE_TEXT}
         for counters, expected in [({"tool_search": 3, "tool_fetch": 2}, (3, 2)), ({}, (0, 0))]:
-            self.expert_response = lambda request: httpx.Response(200, json={
-                "stop_reason": "end_turn", "usage": {"server_tool_use": counters},
-                "content": [{"type": "text", "text": "测试答复"}],
-            })
+            def expert_response(request):
+                self.assertEqual(json.loads(request.content)["max_tokens"], 1200 + 4096)
+                return httpx.Response(200, json={
+                    "stop_reason": "end_turn", "usage": {"server_tool_use": counters},
+                    "content": [{"type": "text", "text": "测试答复"}],
+                })
+
+            self.expert_response = expert_response
             result = self.checked(self.client.post(path, json=question))
             self.assertEqual((result["search_count"], result["read_count"]), expected)
 
@@ -190,9 +195,12 @@ class ApiMonitorTests(unittest.TestCase):
         self.assertEqual(updated["model_id"], self.model["id"])
 
         def chat_reply(request):
+            payload = json.loads(request.content)
+            self.assertNotIn("max_tokens", payload)
+            self.assertNotIn("max_completion_tokens", payload)
             response = self.normal_reply(request).json()
             response["choices"][0]["message"]["content"] = json.dumps({
-                "address": json.loads(json.loads(request.content)["messages"][-1]["content"])["本次发言"],
+                "address": json.loads(payload["messages"][-1]["content"])["本次发言"],
                 "sources": [], "reply": "收到。", "inner_thought": None, "persona_update": None,
             })
             return httpx.Response(200, json=response)
@@ -298,6 +306,34 @@ class ApiMonitorTests(unittest.TestCase):
         self.assertIsNone(monitor["totals"]["total_tokens"])
         self.assertEqual(monitor["alerts"], [])
         self.assertCountEqual([row["outcome"] for row in monitor["recent"]], ["success", "cancelled"])
+
+    def test_poe_truncation_of_required_complete_output_counts_as_failure(self):
+        from thought_app.config import get_model
+        from thought_app.database import connect
+
+        def truncated(request):
+            payload = json.loads(request.content)
+            for field in ("response_format", "max_tokens", "max_completion_tokens"):
+                self.assertNotIn(field, payload)
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content": '{"action":"speak"'}, "finish_reason": "length"}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 646},
+            })
+
+        self.poe_response = truncated
+        with connect() as db:
+            settings = {**get_model(db, self.model["id"]), "task": "agent_decide"}
+        with self.assertRaises(self.llm.ModelError) as failure:
+            asyncio.run(self.llm.complete(
+                settings, [{"role": "user", "content": "输出 JSON。"}],
+                max_tokens=self.llm.agent_output_limit(settings, 650), require_complete=True, json_output=False,
+            ))
+        self.assertEqual(failure.exception.outcome, "invalid_response")
+        recent = self.read_monitor(model_id=self.model["id"])["recent"]
+        self.assertEqual(len(recent), 1)
+        call = recent[0]
+        self.assertEqual((call["task"], call["outcome"]), ("agent_decide", "invalid_response"))
+        self.assertEqual((call["http_status"], call["output_tokens"]), (200, 646))
 
     def test_seeded_poe_environment_key_does_not_follow_an_edited_url(self):
         updated = self.checked(self.client.patch(

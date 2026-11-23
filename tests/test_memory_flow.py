@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import os
 import tempfile
@@ -8,6 +9,7 @@ import unittest
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
+from zipfile import ZipFile
 
 from fastapi.testclient import TestClient
 
@@ -355,26 +357,29 @@ class MemoryFlowTests(unittest.TestCase):
         self.assertEqual(len(result["errors"]), 1)
         self.assertEqual(len(self.chat_prompts), 2)
 
-    def test_long_replies_setting_applies_to_main_and_aside_and_can_be_reset(self):
-        self.assertFalse(self.checked(self.client.get("/api/config"))["long_replies"])
-        def preference(value):
-            self.checked(self.client.patch("/api/config/reply-preferences", json={"long_replies": value}))
-            self.assertEqual(self.checked(self.client.get("/api/config"))["long_replies"], value)
+    def test_old_reply_length_setting_is_ignored_on_restore(self):
+        from thought_app.database import connect
 
-        preference(True)
-        first, second = self.bots[:2]
-        session_id = self.create_session("聊长一些")
-        _, reply = self.mention(session_id, first, "你喜欢这句诗吗？")["messages"]
-        self.assertIn("用户开启了长回答", self.chat_prompts[-1])
-        self.checked(self.client.post(f"/api/sessions/{session_id}/side", json={
-            "bot_id": second["id"], "message_id": reply["id"],
-        }))
-        self.wait_session(session_id, lambda detail: not detail["side_active"])
-        self.assertIn("用户开启了长回答", self.aside_prompts[-1])
-        preference(False)
-        self.mention(session_id, second, "继续聊。")
-        self.assertIn("回答长度随话题调整", self.chat_prompts[-1])
-        self.assertNotIn("用户开启了长回答", self.chat_prompts[-1])
+        with connect() as db:
+            db.execute("INSERT INTO config_settings (key, value) VALUES ('long_replies', '1')")
+        exported = self.client.get("/api/backup/export")
+        exported.raise_for_status()
+        with ZipFile(io.BytesIO(exported.content)) as archive:
+            payload = json.loads(archive.read("journal.json"))
+        stored = payload["tables"]["config_settings"]
+        legacy = {"key": "long_replies", "value": "1"}
+        row = [legacy[column] for column in stored["columns"]]
+        self.assertNotIn(row, stored["rows"])
+        stored["rows"].append(row)
+
+        old_backup = io.BytesIO()
+        with ZipFile(old_backup, "w") as archive:
+            archive.writestr("journal.json", json.dumps(payload))
+        self.checked(self.client.post("/api/backup/import", content=old_backup.getvalue(),
+                                      headers={"Content-Type": "application/zip"}))
+        self.assertNotIn("long_replies", self.checked(self.client.get("/api/config")))
+        with connect() as db:
+            self.assertIsNone(db.execute("SELECT value FROM config_settings WHERE key = 'long_replies'").fetchone())
 
     def test_group_speakers_see_earlier_replies_but_respond_to_the_user(self):
         first, second = self.bots[:2]

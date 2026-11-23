@@ -9,10 +9,13 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .api import backups, sessions, summaries
+from .agent_config import init_agent_config, router as agent_router
+from .agent_store import init_agent_store
 from .config import init_config, router as config_router
 from .database import ROOT, connect, init_journal
 from .evolution import init_evolution, router as evolution_router
 from .observer import init_observer
+from .persona_defaults import migrate_builtin_agent_personas, migrate_builtin_reply_styles
 from .runtime import JournalRuntime
 from .telemetry import init_telemetry, router as telemetry_router
 
@@ -24,8 +27,12 @@ async def lifespan(application):
     with connect() as db:
         db.execute("PRAGMA journal_mode = WAL")
         init_config(db)
+        migrate_builtin_agent_personas(db)
         init_journal(db)
+        init_agent_config(db)
+        init_agent_store(db)
         init_evolution(db)
+        migrate_builtin_reply_styles(db)
         init_observer(db)
         init_telemetry(db)
     runtime = application.state.runtime = JournalRuntime()
@@ -38,7 +45,7 @@ async def lifespan(application):
 
 app = FastAPI(title="想法簿", lifespan=lifespan)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "[::1]", "testserver"])
-for router in (config_router, evolution_router, telemetry_router, sessions.router, summaries.router, backups.router):
+for router in (agent_router, config_router, evolution_router, telemetry_router, sessions.router, summaries.router, backups.router):
     app.include_router(router)
 
 

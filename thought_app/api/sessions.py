@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Request, Response
 
+from ..agent_store import set_archive_shared
 from ..chat import chat
 from ..database import connect
 from ..journal import (
@@ -70,6 +71,8 @@ async def patch_session(request: Request, session_id: int, body: SessionPatch):
                 "UPDATE summaries SET share_enabled = ?, updated_at = ? WHERE session_id = ?",
                 (shared, timestamp(), session_id),
             )
+        if "archive_share_enabled" in changes:
+            set_archive_shared(db, session_id, changes["archive_share_enabled"])
         if changes.get("archived"):
             runtime.sides.stop(session_id)
         return get_session(db, session_id)
@@ -97,8 +100,8 @@ async def chat_route(request: Request, session_id: int, body: ChatInput):
         raise HTTPException(409, "当前会话正在生成内容，等它完成后再回退。")
     active.add(session_id)
     try:
-        outcome, intent = await chat(session_id, body, runtime.observer_wake, stop_side=runtime.sides.stop)
-        runtime.sides.maybe_start(session_id, outcome, intent, body.bot_ids)
+        outcome, route = await chat(session_id, body, runtime.observer_wake, stop_side=runtime.sides.stop)
+        runtime.sides.maybe_start(session_id, outcome, route, body.bot_ids, use_agent=body.use_agent)
         return {**outcome, "side_active": session_id in runtime.sides.tasks}
     finally:
         active.remove(session_id)
@@ -109,7 +112,7 @@ async def interject(request: Request, session_id: int, body: InterjectInput):
     runtime = request.app.state.runtime
     if session_id in runtime.chats:
         raise HTTPException(409, "等主聊的回复出来后再请角色插嘴。")
-    runtime.sides.manual_start(session_id, body.bot_id, body.message_id)
+    runtime.sides.manual_start(session_id, body.bot_id, body.message_id, use_agent=body.use_agent)
     return {"started": True}
 
 

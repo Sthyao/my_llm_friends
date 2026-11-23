@@ -10,6 +10,12 @@ from .telemetry import record_call
 
 
 _LOG = logging.getLogger(__name__)
+_DEFAULT_MAX_TOKENS = 650
+_POE_ENDPOINTS = {"https://api.poe.com", "https://api.poe.com/v1"}
+_DEEPSEEK_ENDPOINTS = {"https://api.deepseek.com", "https://api.deepseek.com/v1"}
+_DEEPSEEK_THINKING_MODELS = {"deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro"}
+_THINKING_BUDGET = {"low": 4096, "high": 8192, "max": 16384}
+_THINKING_TIMEOUT = {"low": 90, "high": 135, "max": 180}
 _QUOTA = re.compile(
     r"insufficient[ _-]?(?:quota|credits?|balance|points|funds)|"
     r"(?:not enough|out of|ran out of|lack of) (?:compute )?(?:points|credits|funds)|"
@@ -75,7 +81,20 @@ def usage_tokens(data):
 def supports_web_search(bot):
     return (bot.get("web_search") and bot["role_mode"] == "friend" and bot["kind"] == "deepseek"
             and bot["model_code"] == "deepseek-flash"
-            and bot["base_url"].rstrip("/") in {"https://api.deepseek.com", "https://api.deepseek.com/v1"})
+            and bot["base_url"].rstrip("/") in _DEEPSEEK_ENDPOINTS)
+
+
+def supports_thinking(settings):
+    return (settings.get("kind") == "deepseek"
+            and settings.get("base_url", "").rstrip("/") in _DEEPSEEK_ENDPOINTS
+            and settings.get("model_code") in _DEEPSEEK_THINKING_MODELS)
+
+
+def agent_output_limit(settings, max_tokens):
+    # Let Poe manage the budget for reasoning and JSON generation.
+    if settings["kind"] == "poe" or settings.get("base_url", "").rstrip("/") in _POE_ENDPOINTS:
+        return None
+    return max_tokens
 
 
 def web_tool_counts(data):
@@ -120,8 +139,9 @@ def expert_answer(data, sources):
     return "".join(parts)
 
 
-async def complete(settings, messages, *, max_tokens=650, json_output=False, web_sources=None, read_links=False,
-                   web_usage=None, call_metrics=None):
+async def complete(settings, messages, *, max_tokens: int | None = _DEFAULT_MAX_TOKENS,
+                   json_output=False, require_complete=False,
+                   web_sources=None, read_links=False, web_usage=None, call_metrics=None):
     started = perf_counter()
     status = None
     usage = {}
@@ -134,30 +154,44 @@ async def complete(settings, messages, *, max_tokens=650, json_output=False, web
         payload = {
             "model": settings["model_code"],
             "messages": messages,
-            "max_tokens": max_tokens,
         }
+        thinking_effort = settings.get("thinking_effort") if supports_thinking(settings) else None
+        thinking_budget = _THINKING_BUDGET.get(thinking_effort, 0)
         if web_sources is not None:
-            if not supports_web_search(settings) or settings.get("task") not in {"reply", "aside", "web_search_test"}:
+            if not supports_web_search(settings) or settings.get("task") not in {
+                "reply", "aside", "agent_express", "web_search_test",
+            }:
                 raise ModelError("此人格或模型无法使用 DeepSeek 联网工具。", "config")
             url = "https://api.deepseek.com/anthropic/v1/messages"
             headers = {"x-api-key": settings["api_key"], "anthropic-version": "2023-06-01"}
+            # With web search enabled, direct reads require the non-thinking path.
+            web_thinking = not read_links and thinking_effort != "off"
             payload.update({
                 "system": "\n\n".join(m["content"] for m in messages if m["role"] == "system"),
                 "messages": [m for m in messages if m["role"] != "system"],
-                "max_tokens": max_tokens + 4096,
-                "thinking": {"type": "disabled" if read_links else "enabled"},
+                "thinking": {"type": "enabled" if web_thinking else "disabled"},
                 "tools": [{"type": name, "name": name} for name in ("deepseek_web_search", "deepseek_read_url")],
                 "stream": False,
             })
+            # DeepSeek's raw Messages HTTP endpoint accepts an omitted max_tokens.
+            if max_tokens is not None:
+                payload["max_tokens"] = max_tokens + max(thinking_budget if web_thinking else 0, 4096)
+            if web_thinking and thinking_budget:
+                payload["output_config"] = {"effort": thinking_effort}
         else:
             url = settings["base_url"].rstrip("/") + "/chat/completions"
             headers = {"Authorization": "Bearer " + settings["api_key"]}
+            if max_tokens is not None:
+                payload["max_tokens"] = max_tokens + thinking_budget
             if settings["kind"] == "deepseek":
-                payload["thinking"] = {"type": "disabled"}
+                payload["thinking"] = {"type": "enabled" if thinking_budget else "disabled"}
+            if thinking_budget:
+                payload["reasoning_effort"] = thinking_effort
             if json_output:
                 payload["response_format"] = {"type": "json_object"}
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(180 if web_sources is not None else 55, connect=8)) as client:
+            timeout = 180 if web_sources is not None else _THINKING_TIMEOUT.get(thinking_effort, 55)
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=8)) as client:
                 response = await client.post(
                     url,
                     headers=headers,
@@ -181,9 +215,9 @@ async def complete(settings, messages, *, max_tokens=650, json_output=False, web
                 body = expert_answer(data, web_sources)
             else:
                 choice = data["choices"][0]
+                if (json_output or require_complete) and choice.get("finish_reason") == "length":
+                    raise ModelError("模型输出达到长度限制，返回内容被截断。")
                 body = choice["message"]["content"]
-                if json_output and choice.get("finish_reason") == "length":
-                    raise ModelError("模型输出超出长度限制，请重试或选择其他模型。")
         except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
             raise ModelError("模型服务未返回兼容的聊天响应。") from exc
         if not isinstance(body, str) or not body.strip():

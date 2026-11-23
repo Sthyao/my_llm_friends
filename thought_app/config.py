@@ -7,8 +7,11 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from exp.harness import persona_source_hash
+
 from .database import connect
-from .llm import ModelError, complete, supports_web_search
+from .evolution import active_traits
+from .llm import ModelError, complete, supports_thinking, supports_web_search
 from .prompts import load_prompt
 
 
@@ -137,6 +140,17 @@ def refresh_friend_voices(conn):
                 assign_starter_persona(conn, bot, bot["name"])
 
 
+def refresh_agent_friend_voices(conn):
+    originals = {
+        "拾荒者": "2f186491e87d78a0cfde1c0b49ebe55877af4778c280a7f795c6964d00040d9c",
+        "刺头": "bef62918738929c3ce3e11523d2cf3a122a91072cba60eaa08b43cf1ca4e0522",
+        "造梦师": "da8104e46cb1909d4e95567d3fa9c4d2433229573630074161ce1689548ad873",
+    }
+    for row in conn.execute("SELECT id, name, prompt FROM personas WHERE web_search = 0").fetchall():
+        if originals.get(row["name"]) == sha256(row["prompt"].encode()).hexdigest():
+            conn.execute("UPDATE personas SET prompt = ? WHERE id = ?", (PERSONAS[row["name"]], row["id"]))
+
+
 def retire_starter_bot(conn, bot):
     tables = conn.execute("""
         SELECT name FROM sqlite_master WHERE type = 'table'
@@ -230,12 +244,14 @@ def init_config(conn: sqlite3.Connection) -> None:
         """)
     if "web_search" not in {row["name"] for row in conn.execute("PRAGMA table_info(personas)")}:
         conn.execute("ALTER TABLE personas ADD COLUMN web_search INTEGER NOT NULL DEFAULT 0 CHECK(web_search IN (0, 1))")
+    conn.execute("DELETE FROM config_settings WHERE key = 'long_replies'")
     seeded = conn.execute(
         "INSERT INTO config_settings (key, value) VALUES ('seeded', '1') ON CONFLICT DO NOTHING"
     )
     if seeded.rowcount == 0:
         refresh_builtin_personas(conn)
         refresh_friend_voices(conn)
+        refresh_agent_friend_voices(conn)
         seed_poe(conn)
         seed_experts(conn)
         return
@@ -317,21 +333,24 @@ def get_model(conn: sqlite3.Connection, model_id: int, *, allow_disabled: bool =
     }
 
 
-def get_bot(conn: sqlite3.Connection, bot_id: int) -> dict:
+def get_bot(conn: sqlite3.Connection, bot_id: int, *, allow_disabled: bool = False) -> dict:
     bot = conn.execute(
-        """SELECT bots.*, personas.prompt, personas.web_search
+        """SELECT bots.*, personas.prompt, personas.web_search,
+                  COALESCE(agent_thinking.effort, 'default') AS thinking_effort
            FROM bots JOIN personas ON personas.id = bots.persona_id
+           LEFT JOIN agent_thinking ON agent_thinking.bot_id = bots.id
            WHERE bots.id = ?""",
         (bot_id,),
     ).fetchone()
     if bot is None:
         raise HTTPException(404, "机器人不存在。")
-    if not bot["enabled"]:
+    if not bot["enabled"] and not allow_disabled:
         raise HTTPException(400, f"机器人「{bot['name']}」已停用。")
-    model = get_model(conn, bot["model_id"])
+    model = get_model(conn, bot["model_id"], allow_disabled=allow_disabled)
     return {
         **model, "bot_id": bot["id"], "bot_name": bot["name"], "prompt": bot["prompt"],
-        "role_mode": bot["role_mode"], "web_search": bool(bot["web_search"]),
+        "persona_id": bot["persona_id"], "role_mode": bot["role_mode"], "web_search": bool(bot["web_search"]),
+        "thinking_effort": bot["thinking_effort"],
     }
 
 
@@ -489,26 +508,6 @@ def validate_config(collection: Collection, body: dict) -> dict:
         raise HTTPException(422, f"{field} · {message}") from None
 
 
-class ReplyPreferences(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    long_replies: bool
-
-
-def long_replies_enabled(conn):
-    row = conn.execute("SELECT value FROM config_settings WHERE key = 'long_replies'").fetchone()
-    return bool(row and row["value"] == "1")
-
-
-@router.patch("/reply-preferences")
-def update_reply_preferences(body: ReplyPreferences):
-    with connect() as conn:
-        conn.execute("""
-            INSERT INTO config_settings (key, value) VALUES ('long_replies', ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """, ("1" if body.long_replies else "0",))
-    return body
-
-
 class ReplyModels(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     router_model_id: Annotated[int | None, Field(gt=0)] = None
@@ -534,6 +533,7 @@ def update_reply_models(body: ReplyModels):
 @router.get("")
 def config_state() -> dict:
     with connect() as conn:
+        conn.execute("BEGIN")
         config = {
             collection: [
                 public_config(collection, row)
@@ -542,15 +542,23 @@ def config_state() -> dict:
             for collection in INPUTS
         }
         online_personas = {p["id"] for p in config["personas"] if p["web_search"]}
+        base_hashes = {p["id"]: persona_source_hash(p["prompt"]) for p in config["personas"]}
+        providers = {provider["id"]: provider for provider in config["providers"]}
+        for model in config["models"]:
+            provider = providers[model["provider_id"]]
+            model["thinking_supported"] = supports_thinking({**provider, "model_code": model["model_code"]})
         enabled_models = {m["id"] for m in config["models"] if m["enabled"]}
         for bot in config["bots"]:
+            bot["evolved_preferences"] = [
+                trait["description"] for trait in active_traits(conn, bot["id"], base_hashes[bot["persona_id"]])
+            ] if bot["role_mode"] != "mirror" else []
             bot["can_web_search"] = False
             if bot["enabled"] and bot["model_id"] in enabled_models and bot["persona_id"] in online_personas:
                 settings = get_bot(conn, bot["id"])
                 bot["can_web_search"] = bool(supports_web_search(settings) and settings["api_key"])
         return {
             **config, **{key: _enabled_reply_model_id(conn, key) for key in _REPLY_MODEL_KEYS},
-            "summary_model_id": get_summary_model_id(conn), "long_replies": long_replies_enabled(conn),
+            "summary_model_id": get_summary_model_id(conn),
         }
 
 

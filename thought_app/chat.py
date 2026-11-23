@@ -6,7 +6,9 @@ import re
 from fastapi import HTTPException
 
 from . import llm
-from .config import get_bot, get_fallback_model, get_router_model, long_replies_enabled
+from .agent_config import agent_settings
+from .agents import plan_agents, save_agent_turn
+from .config import get_bot, get_fallback_model, get_router_model
 from .conversation import Conversation, sender
 from .database import connect
 from .evolution import get_evolution, remember_evolution
@@ -15,6 +17,7 @@ from .memory import read_citations, recall
 from .observer import enqueue_observation, mirror_context, recall_observations
 from .prompts import load_prompt
 from .rewind import rewind_history
+from .routing import DEPTH, ENGAGEMENT, TurnRoute, parse_route
 
 
 _LOG = logging.getLogger(__name__)
@@ -26,6 +29,7 @@ PEER_PROMPT = load_prompt("peer")
 REPLY_PROMPT = load_prompt("reply")
 REPAIR_PROMPT = load_prompt("reply-repair")
 MIRROR_PROMPT = load_prompt("mirror")
+EVOLUTION_PROMPT = load_prompt("agent-evolution")
 
 
 def unwrap_json(raw):
@@ -81,46 +85,34 @@ def candidates_packet(bots):
             for bot in bots]
 
 
-async def choose_direct(bots, messages, members, router=None):
+async def choose_direct(bots, messages, members, router=None, *, directed=False, target=None):
     if not bots:
-        return "note", []
+        return TurnRoute("note")
     friends = [bot for bot in bots if bot["role_mode"] == "friend"]
     first = next((bot for bot in friends if bot["api_key"]), friends[0] if friends else None)
     available = {bot["bot_id"]: bot for bot in friends if bot["api_key"]}
     previous = next((available[m["bot_id"]] for m in reversed(messages)
                      if m["channel"] == "main" and m["bot_id"] in available), first)
-    fallback = ("idea", [previous]) if previous else ("note", [])
+    fallback = TurnRoute(primary=bots if directed else [previous] if previous else [])
     model = router or next((bot for bot in bots if bot["api_key"]), bots[0])
+    conversation = Conversation(messages)
+    turn = next(message for message in reversed(messages) if message["role"] == "user")
+    packet = {
+        "候选人": candidates_packet(bots), "群成员": members,
+        "近期群聊": [event for event in conversation.recent() if event["id"] != turn["id"]],
+        "最新用户消息id": turn["id"], "最新用户原话": conversation.event(turn),
+        "已点名": directed,
+    }
+    if target is not None and target["id"] != turn["id"]:
+        packet["请接这条发言"] = conversation.event(target)
     try:
         raw = await llm.complete({**model, "task": "route"}, [
             {"role": "system", "content": ROUTER_PROMPT},
-            {"role": "user", "content": json.dumps({
-                "候选人": candidates_packet(bots), "群成员": members, "近期群聊": Conversation(messages).recent(),
-                "最新用户消息id": messages[-1]["id"],
-            }, ensure_ascii=False)},
-        ], max_tokens=350, json_output=model["kind"] == "deepseek")
+            {"role": "user", "content": json.dumps(packet, ensure_ascii=False)},
+        ], max_tokens=llm.agent_output_limit(model, 900), json_output=model["kind"] == "deepseek")
     except llm.ModelError:
         return fallback
-    plan = structured_response(raw)
-    if plan is None or not isinstance(plan.get("primary"), list):
-        return fallback
-    intent = plan.get("intent")
-    if intent not in ("greeting", "idea", "emotion", "question", "self_reflection", "note"):
-        intent = "idea"
-    quiet_quote = plan.get("quiet_quote")
-    if intent == "note" and isinstance(quiet_quote, str) and quiet_quote.strip() and quiet_quote in messages[-1]["content"]:
-        return "note", []
-    by_id = {bot["bot_id"]: bot for bot in bots}
-    selected = {}
-    for item in plan["primary"]:
-        if not isinstance(item, dict) or type(item.get("bot_id")) is not int:
-            continue
-        bot = by_id.get(item["bot_id"])
-        if bot and (bot["role_mode"] == "friend" or intent == "self_reflection"):
-            selected.setdefault(bot["bot_id"], bot)
-    if not selected:
-        return fallback
-    return ("idea" if intent == "note" else intent), list(selected.values())[:1 if intent == "greeting" else 2]
+    return parse_route(structured_response(raw), bots, turn["content"], fallback=fallback, directed=directed)
 
 
 @dataclass
@@ -189,7 +181,7 @@ def recover_json_field(raw, key):
     return None
 
 
-async def repair_reply(model, raw, original, address, bot_name, max_tokens):
+async def repair_reply(model, raw, original, address, bot_name):
     if original is not None:
         original_reply = original.get("reply")
         old_address = original.get("address")
@@ -214,7 +206,7 @@ async def repair_reply(model, raw, original, address, bot_name, max_tokens):
             {"role": "user", "content": json.dumps({
                 "本次发言": address, "待修复输出": raw,
             }, ensure_ascii=False)},
-        ], max_tokens=max_tokens + 200, json_output=model["kind"] == "deepseek")
+        ], max_tokens=None, json_output=model["kind"] == "deepseek")
     except llm.ModelError:
         return None
     data = structured_response(repaired)
@@ -230,16 +222,21 @@ async def repair_reply(model, raw, original, address, bot_name, max_tokens):
     return data
 
 
-async def speak(bot, messages, turn, target, *, directed, shared, shared_citations, aside=False, reason="", required=False):
+async def speak(bot, messages, turn, target, *, directed, shared, shared_citations, aside=False, reason="",
+                required=False, agent_plan=None, response_direction=None):
     query = "\n".join([turn["content"], target["content"]] +
                       [msg["content"] for msg in messages[-8:] if msg["role"] == "user"][-2:])
     is_mirror = bot["role_mode"] == "mirror"
     with connect() as db:
         members = group_members(db)
-        long_replies = long_replies_enabled(db)
         router = get_router_model(db)
         formatter = get_fallback_model(db)
-        evolution = {"enabled": False, "notes": []} if is_mirror else get_evolution(db, bot["bot_id"], query)
+        if agent_plan:
+            evolution = agent_plan.evolution
+        elif is_mirror:
+            evolution = {"enabled": False, "notes": []}
+        else:
+            evolution = get_evolution(db, bot["bot_id"], query)
         if is_mirror:
             observer, observer_citations = mirror_context(db, query, turn["id"])
         else:
@@ -247,6 +244,7 @@ async def speak(bot, messages, turn, target, *, directed, shared, shared_citatio
     # The mirror uses user-sourced observations and its supplied conversation, not summaries of AI opinions.
     citations = observer_citations if is_mirror else {**shared_citations, **observer_citations}
     notes = []
+    preferences = []
     for note in evolution["notes"]:
         source = note["source_message_id"]
         token = f"M{source}"
@@ -255,24 +253,27 @@ async def speak(bot, messages, turn, target, *, directed, shared, shared_citatio
             "session_title": note.get("source_session_title", "旧会话"),
             "message_id": source, "label": "此前的发言",
         }
-        notes.append({"id": note["id"], "kind": note["kind"], "text": note["text"], "source": f"[{token}]"})
+        item = {"id": note["id"], "kind": note["kind"], "text": note["text"], "source": f"[{token}]"}
+        if skill := note.get("skill"):
+            item["skill"] = skill
+            preferences.append(item)
+        else:
+            notes.append(item)
     peer = target["role"] == "assistant"
     if is_mirror:
         persona = MIRROR_PROMPT
+        if agent_plan and agent_plan.profile["voice"]:
+            persona += "\n" + agent_plan.profile["voice"]
         if peer:
             persona += "\n你以拟写的用户视角接这位群友的话。群友的观点只作为回应对象。"
     else:
-        persona = (PEER_PROMPT if peer else FRIEND_PROMPT) + f"\n你叫{bot['bot_name']}。{bot['prompt']}"
+        voice = agent_plan.profile["voice"] if agent_plan else bot["prompt"]
+        persona = (PEER_PROMPT if peer else FRIEND_PROMPT) + f"\n你叫{bot['bot_name']}。{voice}"
     system = persona + "\n\n" + REPLY_PROMPT
     web_enabled = llm.supports_web_search(bot)
-    if long_replies:
-        system += ("\n用户开启了长回答。遇到有内容的话题，像一对一深聊一样用几段把自己的想法说透。"
-                   "抓住对方说的具体细节，说说你怎么读、为什么这么想，再沿着它聊到一个新发现、场景或例子。"
-                   "值得聊时可以写三五百字或更多，写到意思完整。保留朋友的语气。"
-                   "简单寒暄自然简短，对方当下明确要求简短或只想听着时以那句话为准。")
-    else:
-        system += "\n回答长度随话题调整。寒暄可以很短；读到一段诗、一个复杂的念头或问题时，顺着细节多聊几段。"
-    if not evolution["enabled"]:
+    if agent_plan and evolution["enabled"]:
+        system += "\n" + EVOLUTION_PROMPT
+    elif not evolution["enabled"]:
         system += "\n本次 persona_update 必须为 null。"
     if directed:
         system += "\n用户邀请你接指定的这句话，请直接回应它的作者。"
@@ -282,29 +283,83 @@ async def speak(bot, messages, turn, target, *, directed, shared, shared_citatio
 
     required = required or directed
     if required:
-        system += "\n这句话由你来接。reply 请写出实际的聊天回复。对方想保留一点余味时，顺着聊一句也可以。"
+        system += "\n这句话由你来接。reply 请写出实际的聊天回复。"
 
     conversation = Conversation(messages)
     address = {"from": f"bot:{bot['bot_id']}", "to": sender(target), "reply_to": target["id"]}
     context = {
         "群成员": members, "本次发言": address,
         "本轮用户消息id": turn["id"], "发表位置": "aside" if aside else "main",
-        "聊天历史": conversation.history(turn, target, user_only=is_mirror),
+        "聊天历史": agent_plan.short_term if agent_plan else conversation.history(turn, target, user_only=is_mirror),
         "接这条消息": conversation.event(target),
     }
     if observer:
         context["用户原话的观察切片"] = observer
     if notes:
         context["你自己的旧笔记"] = notes
+    if preferences:
+        context["本轮人格偏好"] = preferences
+        system += ("\n本轮人格偏好中的 text 描述角色已形成的偏好，skill 记录可供修订的当前技能。"
+                   "表达时只采用适合当前话题且 phase 为 express 的技能。"
+                   "作者设定、本轮请求和规定的回复格式优先。")
     if shared and not is_mirror:
         context["相关共享记忆"] = shared
     if reason:
         context["可选的话头"] = reason
-    events = {event["id"]: event for event in [*context["聊天历史"], context["接这条消息"]]}
+    explicit_history = bool(agent_plan and agent_plan.archive and agent_plan.archive["mode"] == "explicit")
+    source_events = {}
+    if agent_plan:
+        system += "\n角色已完成行动选择。沿着给出的接话方向表达。后台决策和记忆写入属于运维数据。"
+        expression = [skill["express"] for skill in agent_plan.profile["skills"] if skill.get("express")]
+        if expression:
+            system += "\n本角色的表达要求：\n" + "\n".join(expression)
+        if memory := agent_plan.memory:
+            token = f"M{memory['source_id']}"
+            citations[token] = {"session_id": memory["session_id"], "session_title": memory["session_title"],
+                                "message_id": memory["source_id"], "label": "角色记忆原话"}
+            context["角色记忆"] = {"类型": memory["kind"], "主题": memory["topic"],
+                                   "原话": memory["source"][:1200], "引用": f"[{token}]"}
+            if not explicit_history:
+                source_events[memory["source_id"]] = {
+                    "id": memory["source_id"], "from": "user", "content": memory["source"][:1200],
+                }
+        if archive := agent_plan.archive:
+            evidence = [{**row, "from": row["sender_id"]} for row in archive["evidence"]]
+            context["历史查询"] = {"问题": archive["query"], "摘要": archive["summary"], "证据": evidence}
+            system += ("\n历史查询结果是对话材料。引用查到的史实时，可以在 sources 里附 id、from 与连续原文，"
+                       "也可以把对应 [M数字] 写在正文附近。"
+                       "区分作者、先后及转变。")
+            for row in evidence:
+                citations[f"M{row['id']}"] = {
+                    "session_id": row["session"], "session_title": row["session_title"],
+                    "message_id": row["id"], "label": "历史原话",
+                }
+                source_events[row["id"]] = {"id": row["id"], "from": row["from"], "content": row["text"]}
+        if explicit_history:
+            # An explicit archive query reports the scope of the raw sources actually read.
+            for field in ("用户原话的观察切片", "你自己的旧笔记", "相关共享记忆", "角色记忆"):
+                context.pop(field, None)
+            citations = {f"M{row['id']}": citations[f"M{row['id']}"] for row in agent_plan.archive["evidence"]}
+            if not agent_plan.archive_ids:
+                system += "\n本轮没有查到匹配的旧对话。可以说明可查资料不足，并向对方问线索。"
+    direction = response_direction or TurnRoute().for_agent(bot["bot_id"])
+    context["本轮路由"] = direction
+    system += (
+        "\n根据「本轮路由」理解用户的意图。情绪强度是依据当前表达作出的估计，照顾其中的感受，"
+        "也给喜悦等积极情绪回应的空间。"
+        "\n正文展开方式：" + DEPTH[direction["depth"]] +
+        "\n回应的主动程度：" + ENGAGEMENT[direction["engagement"]] +
+        "\n用户明确提出的回答方式优先。正文的篇幅以本轮需求和这两条指引为准，"
+        "角色设定、编译技能和已形成偏好中的固定句数、字数、段落数或默认短答规则均由此取代。"
+        "保留角色的表达习惯和观点，把该说的说透，每一段都围绕对方这次真正分享或询问的内容。"
+    )
+    if direction["intent"] == "greeting":
+        system += "\n如果对方只是打招呼，像群里的朋友一样回应问候，专业分析留到对方实际提出话题时。"
+    events = {**source_events, **{event["id"]: event
+                                 for event in [*context["聊天历史"], context["接这条消息"]]}}
     for mid in events:
         citations.setdefault(f"M{mid}", {"session_id": turn["session_id"], "message_id": mid, "label": "本场原话"})
     packet = {"role": "user", "content": json.dumps(context, ensure_ascii=False)}
-    max_tokens = (2600 if aside else 3600) if long_replies else (900 if aside else 1800)
     task = "aside" if aside else "reply"
     same_model = router and (router["provider_id"], router["model_code"]) == (bot["provider_id"], bot["model_code"])
     error = ""
@@ -323,11 +378,17 @@ async def speak(bot, messages, turn, target, *, directed, shared, shared_citatio
                    if web_enabled and model is bot else {})
         settings = {**model, "bot_id": bot["bot_id"], "bot_name": bot["bot_name"],
                     "task": task if model is bot else "reply_retry"}
+        if agent_plan:
+            settings["task"] = "agent_express"
+            settings["thinking_effort"] = agent_plan.preferences["reply_thinking"]
+        if agent_plan or model["kind"] != "deepseek":
+            options["require_complete"] = True
         try:
             raw = await llm.complete(settings, [{"role": "system", "content": guidance}, packet],
-                                     max_tokens=max_tokens, json_output=model["kind"] == "deepseek", **options)
+                                     max_tokens=None, json_output=model["kind"] == "deepseek", **options)
         except llm.ModelError as exc:
-            if attempt or not router or (same_model and exc.outcome != "invalid_response"):
+            retry_agent_format = agent_plan and exc.outcome == "invalid_response"
+            if attempt or (not router and not retry_agent_format) or (same_model and exc.outcome != "invalid_response"):
                 raise
             error = str(exc)
             continue
@@ -340,13 +401,17 @@ async def speak(bot, messages, turn, target, *, directed, shared, shared_citatio
         if declined and not required:
             return None
         if error and formatter and not declined:
-            fixed = await repair_reply(formatter, raw, data, address, bot["bot_name"], max_tokens)
+            fixed = await repair_reply(formatter, raw, data, address, bot["bot_name"])
             if fixed is not None:
                 data, error = fixed, None
         if declined:
             error = "机器人未生成可显示的回复。请在 reply 中写出给对方的话。"
         if error is None:
             error = reply_grounding_error(data, address, events, citations, peer=peer)
+        if (error is None and explicit_history and agent_plan.archive_ids and isinstance(data["reply"], str)
+                and not any(f"[M{source}]" in data["reply"] for source in agent_plan.archive_ids)
+                and not any(source["id"] in agent_plan.archive_ids for source in data["sources"])):
+            error = "回复需要标注本轮查到的历史原话出处。请在相应位置加上资料里的 [M数字]。"
         if error is None:
             break
         _LOG.info("Reply validation failed for message %s, bot %s, attempt %s: %s",
@@ -371,7 +436,8 @@ async def speak(bot, messages, turn, target, *, directed, shared, shared_citatio
         if source["id"] != target["id"] and ref not in references:
             references.append(ref)
     attributed_model = {field: model[field] for field in ("provider_name", "name", "model_code")}
-    return BotReply(content, thought, references, proposal, {n["id"] for n in notes}, attributed_model)
+    seen_ids = {n["id"] for n in notes + preferences} if not explicit_history else set()
+    return BotReply(content, thought, references, proposal, seen_ids, attributed_model)
 
 
 def save_bot_reply(session_id, bot, turn, target, result, *, channel="main"):
@@ -410,7 +476,9 @@ async def chat(session_id, request, observer_wake, *, stop_side):
             db, session_id, previous + [{"role": "user", "content": request.content}],
         ) if bots else ([], {}, [])
         members = group_members(db)
-        router = get_router_model(db) if bots and not mentions else None
+        preferences = agent_settings(db) if request.use_agent else None
+        use_agent = bool(preferences and preferences["enabled"])
+        router = get_router_model(db) if bots and (not mentions or use_agent) else None
         audience = [f"bot:{bot['bot_id']}" for bot in mentions] or ["group"]
         current = add_message(db, session_id, "user", request.content, references=loaded, audience=audience)
         enqueue_observation(db, current["id"])
@@ -423,13 +491,57 @@ async def chat(session_id, request, observer_wake, *, stop_side):
     stop_side(session_id)
     observer_wake.set()
     responses, errors = [], []
-    if mentions:
-        intent, primary = "directed", mentions
+    if mentions and not use_agent:
+        route = TurnRoute(primary=mentions)
     else:
-        intent, primary = await choose_direct(bots, previous + [current], members, router)
+        route = await choose_direct(mentions or bots, previous + [current], members, router, directed=bool(mentions))
+    primary = route.primary
+    agent_selected = False
+    if use_agent:
+        mirrors = [bot for bot in primary if bot["role_mode"] == "mirror"]
+        candidates = mentions or (mirrors if route.intent == "self_reflection" else [])
+        if not candidates:
+            candidates = [bot for bot in [*primary, *bots] if bot["role_mode"] == "friend"]
+        if candidates:
+            agent_selected = True
+            shortlist = list({bot["bot_id"]: bot for bot in candidates}.values())[:3]
+            plans, failures = await plan_agents(
+                shortlist, previous + [current], current, current, preferences, directed=bool(mentions),
+                response_directions={bot["bot_id"]: route.for_agent(bot["bot_id"]) for bot in shortlist},
+            )
+            errors.extend(failures)
+            primary_ids = {bot["bot_id"] for bot in primary}
+            chosen = sorted(
+                (plan for plan in plans if plan.decision["action"] == "speak" and route.intent != "note"),
+                key=lambda plan: (plan.priority, plan.bot["bot_id"] in primary_ids), reverse=True,
+            )
+            reply_limit = len(mentions) or max(1, len(primary))
+            generated = []
+            for plan in chosen:
+                if generated and not mentions and plan.bot["bot_id"] not in primary_ids:
+                    continue
+                try:
+                    explicit_archive = plan.archive and plan.archive["mode"] == "explicit"
+                    reason = plan.decision["reason"]
+                    if plan.decision.get("matched_memory_id") and not plan.memory:
+                        reason = ""
+                    result = await speak(
+                        plan.bot, previous + [current], current, current, directed=bool(mentions), required=True,
+                        shared=[] if explicit_archive else shared, shared_citations={} if explicit_archive else citations,
+                        reason=reason, agent_plan=plan, response_direction=route.for_agent(plan.bot["bot_id"]),
+                    )
+                except llm.ModelError as exc:
+                    errors.append({"bot_name": plan.bot["bot_name"], "round": 1, "detail": str(exc)})
+                    continue
+                if result is not None:
+                    generated.append((plan, result))
+                    if len(generated) >= reply_limit:
+                        break
+            responses.extend(save_agent_turn(session_id, current, current, plans, generated))
+            primary = []
     # If all selected speakers fail, let one other eligible friend take the turn.
     speakers = list(primary)
-    if primary and not mentions:
+    if primary and not mentions and not agent_selected:
         alternate = next((bot for bot in bots if bot["role_mode"] == "friend"
                           and bot["api_key"] and bot not in primary), None)
         if alternate:
@@ -441,6 +553,7 @@ async def chat(session_id, request, observer_wake, *, stop_side):
             result = await speak(
                 bot, previous + [current] + responses, current, current,
                 directed=bool(mentions), required=not responses, shared=shared, shared_citations=citations,
+                response_direction=route.for_agent(bot["bot_id"]),
             )
         except llm.ModelError as exc:
             _LOG.warning("Main reply failed for message %s, bot %s: %s", current["id"], bot["bot_id"], exc)
@@ -449,4 +562,4 @@ async def chat(session_id, request, observer_wake, *, stop_side):
         if result is not None:
             responses.append(save_bot_reply(session_id, bot, current, current, result))
 
-    return {"messages": [current, *responses], "errors": errors, "memories": loaded}, intent
+    return {"messages": [current, *responses], "errors": errors, "memories": loaded}, route

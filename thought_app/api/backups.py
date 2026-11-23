@@ -12,6 +12,7 @@ from starlette.concurrency import run_in_threadpool
 from ..backup import MAX_UPLOAD_BYTES, BackupError, export_backup, read_backup, restore_backup
 from ..config import seed_experts
 from ..database import connect, database_path
+from ..persona_defaults import AGENT_PERSONA_REWRITE_KEY, migrate_builtin_reply_styles
 
 
 router = APIRouter(prefix="/api/backup", tags=["backup"])
@@ -59,6 +60,9 @@ def apply_backup(payload):
             raise
         restored = restore_backup(db, payload)
         seed_experts(db)
+        migrate_builtin_reply_styles(db)
+        db.execute("INSERT OR IGNORE INTO config_settings (key, value) VALUES (?, '1')",
+                   (AGENT_PERSONA_REWRITE_KEY,))
     return {"restored": restored, "safety_backup": archive.name}
 
 

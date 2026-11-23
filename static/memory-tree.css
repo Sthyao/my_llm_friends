@@ -1,0 +1,232 @@
+.memory-tree {
+  --branch-line: #c5b79c;
+  --branch-inset: 16px;
+  min-width: 0;
+}
+
+@media (min-width: 1001px) {
+  .memory-grid--tree {
+    grid-template-columns: minmax(0, 1.54fr) minmax(250px, 1fr);
+  }
+}
+
+.memory-tree-heading {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-block-end: 14px;
+}
+
+.memory-tree-heading h2 {
+  margin: 0;
+  font: 700 24px/1.25 var(--editorial);
+}
+
+.memory-tree-heading p {
+  margin: 3px 0 0;
+  color: var(--quiet);
+  font-size: 12px;
+}
+
+.memory-tree-heading .button-row .btn {
+  min-height: 32px;
+  padding: 3px 9px;
+}
+
+.memory-node-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+
+.memory-node {
+  position: relative;
+  min-width: 0;
+  scroll-margin-top: 16px;
+}
+
+.memory-node + .memory-node {
+  margin-block-start: 7px;
+}
+
+.memory-node-roots > .memory-node + .memory-node {
+  margin-block-start: 14px;
+}
+
+.memory-node-children {
+  margin-block-start: 7px;
+  margin-inline-start: var(--branch-inset);
+  padding-inline-start: var(--branch-inset);
+  border-inline-start: 1px solid var(--branch-line);
+}
+
+.memory-node-children > .memory-node::before {
+  content: "";
+  position: absolute;
+  inset-block-start: 23px;
+  inset-inline-start: calc(var(--branch-inset) * -1);
+  width: var(--branch-inset);
+  border-block-start: 1px solid var(--branch-line);
+  pointer-events: none;
+}
+
+.memory-node--depth-3 > .memory-node-children {
+  margin-inline-start: 0;
+  padding-inline-start: 0;
+  border-inline-start: 0;
+}
+
+.memory-node--depth-3 > .memory-node-children > .memory-node::before {
+  display: none;
+}
+
+.memory-node-entry {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.memory-node-entry--origin {
+  background: #f8efdf;
+  border-color: #d3c3a5;
+}
+
+.memory-node-entry--aside {
+  border-inline-start: 3px solid #8b9a83;
+}
+
+.memory-node-entry--highlight {
+  border-color: var(--clay);
+  box-shadow: 0 0 0 2px #a2533e2c;
+}
+
+.memory-node-summary {
+  position: relative;
+  display: grid;
+  align-items: center;
+  grid-template-columns: max-content minmax(0, 1fr) max-content;
+  gap: 3px 8px;
+  padding: 9px 29px 9px 11px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.memory-node-summary::-webkit-details-marker {
+  display: none;
+}
+
+.memory-node-summary::after {
+  content: "";
+  position: absolute;
+  inset-block-start: 18px;
+  inset-inline-end: 13px;
+  width: 6px;
+  height: 6px;
+  border-inline-end: 1px solid var(--accent-strong);
+  border-block-end: 1px solid var(--accent-strong);
+  transform: rotate(-45deg);
+}
+
+.memory-node-entry[open] > .memory-node-summary::after {
+  transform: rotate(45deg);
+}
+
+.memory-node-order,
+.memory-node-summary time,
+.memory-node-relation {
+  color: var(--quiet);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.memory-node-order {
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+
+.memory-node-label {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px 6px;
+  min-width: 0;
+}
+
+.memory-node-label strong {
+  overflow-wrap: anywhere;
+}
+
+.memory-node-channel {
+  padding: 0 6px;
+  border-radius: 4px;
+  background: var(--surface-mute);
+  color: var(--quiet);
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+.memory-node-entry--aside .memory-node-channel {
+  background: var(--soft-green);
+  color: var(--accent-strong);
+}
+
+.memory-node-relation,
+.memory-node-preview {
+  grid-column: 1 / -1;
+}
+
+.memory-node-preview {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+}
+
+.memory-node-entry[open] > .memory-node-summary .memory-node-preview {
+  display: none;
+}
+
+.memory-node-full {
+  margin-inline: 11px;
+  padding-block: 8px 12px;
+  border-block-start: 1px solid var(--line);
+  font-size: 14px;
+}
+
+@media (max-width: 680px) {
+  .memory-tree {
+    --branch-inset: 9px;
+  }
+
+  .memory-node--depth-2 > .memory-node-children {
+    margin-inline-start: 0;
+    padding-inline-start: 0;
+    border-inline-start: 0;
+  }
+
+  .memory-node--depth-2 > .memory-node-children > .memory-node::before {
+    display: none;
+  }
+
+  .memory-node-summary {
+    gap: 2px 6px;
+    padding-inline: 8px 24px;
+  }
+
+  .memory-node-summary::after {
+    inset-inline-end: 10px;
+  }
+
+  .memory-node-summary time {
+    font-size: 10px;
+  }
+
+  .memory-node-full {
+    margin-inline: 8px;
+  }
+}

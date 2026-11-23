@@ -8,6 +8,7 @@ from pathlib import Path
 from zipfile import BadZipFile, ZIP_DEFLATED, ZIP_STORED, ZipFile
 import zlib
 
+from .persona_defaults import AGENT_PERSONA_REWRITE_KEY
 
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_JSON_BYTES = 128 * 1024 * 1024
@@ -17,20 +18,28 @@ _ENTRY = "journal.json"
 _MAX_INT = 2**63 - 1
 
 # Parent tables precede their children. The archive carries data only.
-_TABLES = (
+_BASE_TABLES = (
     "providers", "models", "personas", "bots", "config_settings",
     "sessions", "messages", "summaries", "rewind_drafts",
     "bot_evolution_settings", "bot_evolution_notes", "observer_jobs", "observer_observations",
     "api_usage_alerts", "api_usage_calls",
 )
+_AGENT_TABLES = (
+    "agent_persona_programs", "agent_archive_sharing", "agent_memories",
+    "agent_reply_sources", "agent_reply_metadata", "agent_thinking", "agent_evolution_traits",
+)
+_TABLES = _BASE_TABLES + _AGENT_TABLES
 _SEQUENCED = frozenset({
     "providers", "models", "personas", "bots", "sessions", "messages", "bot_evolution_notes",
-    "observer_observations", "api_usage_alerts", "api_usage_calls",
+    "observer_observations", "api_usage_alerts", "api_usage_calls", "agent_memories",
 })
 _PUBLIC_SETTINGS = (
-    "seeded", "poe_seeded", "group_personas_v3", "friend_voices_v4", "expert_personas_v1", "summary_model_id", "long_replies",
+    "seeded", "poe_seeded", "group_personas_v3", "friend_voices_v4", "expert_personas_v1", "summary_model_id",
     "router_model_id", "fallback_model_id",
+    "agent_enabled", "agent_compile_thinking", "agent_decision_thinking", "agent_reply_thinking",
+    AGENT_PERSONA_REWRITE_KEY,
 )
+_IMPORT_SETTINGS = (*_PUBLIC_SETTINGS, "long_replies")
 
 
 class BackupError(ValueError):
@@ -160,7 +169,9 @@ def read_backup(path: Path) -> dict:
     except (TypeError, ValueError) as exc:
         raise BackupError("备份时间无效。") from exc
     tables = payload["tables"]
-    if not isinstance(tables, dict) or set(tables) != set(_TABLES):
+    prior_agent_tables = set(_TABLES) - {"agent_evolution_traits"}
+    compatible_tables = (set(_BASE_TABLES), prior_agent_tables - {"agent_thinking"}, prior_agent_tables, set(_TABLES))
+    if not isinstance(tables, dict) or set(tables) not in compatible_tables:
         raise BackupError("备份表不完整，或者包含不支持的表。")
     for table in tables.values():
         if (
@@ -244,7 +255,7 @@ def _validate_rows(db, tables):
                 raise BackupError(f"备份表 {name} 含有无效的记录。")
             if any(row[index] is not None and not _valid_json_array(row[index], check) for index, check in checks_by_index):
                 raise BackupError(f"备份表 {name} 含有无效的结构化内容。")
-            if name == "config_settings" and row[columns.index("key")] not in _PUBLIC_SETTINGS:
+            if name == "config_settings" and row[columns.index("key")] not in _IMPORT_SETTINGS:
                 raise BackupError("备份包含不支持的设置。")
 
 
@@ -265,7 +276,9 @@ def restore_backup(db: sqlite3.Connection, payload: dict) -> dict:
     """Replace local rows inside the caller's SQLite transaction."""
     if not db.in_transaction or not db.execute("PRAGMA foreign_keys").fetchone()[0]:
         raise RuntimeError("Restore requires an open SQLite transaction with foreign keys enabled.")
-    tables = payload["tables"]
+    tables = {**payload["tables"]}
+    for name in _AGENT_TABLES:
+        tables.setdefault(name, {"columns": list(_columns(db, name)), "rows": []})
     _validate_rows(db, tables)
     credentials = _saved_credentials(db, tables["providers"])
     db.execute("SAVEPOINT restore_journal")
@@ -278,6 +291,7 @@ def restore_backup(db: sqlite3.Connection, payload: dict) -> dict:
             columns = ", ".join(map(_identifier, table["columns"]))
             placeholders = ", ".join("?" for _ in table["columns"])
             db.executemany(f"INSERT INTO {_identifier(name)} ({columns}) VALUES ({placeholders})", table["rows"])
+        db.execute("DELETE FROM config_settings WHERE key = 'long_replies'")
         db.executemany(
             "UPDATE providers SET api_key = ? WHERE kind = ? AND base_url = ? AND name = ?",
             [(key, *identity) for identity, key in credentials.items()],

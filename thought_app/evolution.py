@@ -7,6 +7,9 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
+from exp.harness import persona_source_hash
+
+from .agent_store import visible_agent_message
 from .database import connect
 from .journal import timestamp
 from .memory import normalize
@@ -28,6 +31,14 @@ class EvolutionProposal(BaseModel):
     keywords: list[EvolutionKeyword] = Field(min_length=1, max_length=8)
     evidence: str = Field(min_length=4, max_length=240)
     replaces_id: int | None = Field(default=None, gt=0)
+
+
+class EvolutionSkill(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+
+    name: str = Field(min_length=1, max_length=80)
+    phase: Literal["attention", "decision", "express"]
+    instruction: str = Field(min_length=4, max_length=360)
 
 
 class EvolutionPatch(BaseModel):
@@ -59,23 +70,57 @@ def init_evolution(db: Connection) -> None:
             ON bot_evolution_notes(bot_id, active, id DESC);
         CREATE INDEX IF NOT EXISTS bot_evolution_revisions
             ON bot_evolution_notes(replaces_id);
+        CREATE TABLE IF NOT EXISTS agent_evolution_traits (
+            note_id INTEGER PRIMARY KEY REFERENCES bot_evolution_notes(id) ON DELETE CASCADE,
+            base_hash TEXT NOT NULL,
+            skill_name TEXT NOT NULL,
+            phase TEXT NOT NULL CHECK(phase IN ('attention', 'decision', 'express')),
+            instruction TEXT NOT NULL
+        );
+        CREATE TRIGGER IF NOT EXISTS retract_evolved_skill
+        BEFORE DELETE ON bot_evolution_notes
+        WHEN EXISTS (SELECT 1 FROM agent_evolution_traits WHERE note_id = OLD.id)
+          OR EXISTS (SELECT 1 FROM agent_evolution_traits t JOIN bot_evolution_notes successor
+                     ON successor.id = t.note_id WHERE successor.replaces_id = OLD.id)
+        BEGIN
+            UPDATE bot_evolution_notes SET replaces_id = OLD.replaces_id
+            WHERE replaces_id = OLD.id;
+            UPDATE bot_evolution_notes SET active = 1
+            WHERE OLD.active = 1 AND id = OLD.replaces_id AND active = 0
+              AND NOT EXISTS (
+                SELECT 1 FROM bot_evolution_notes other
+                WHERE other.id != OLD.id AND (other.replaces_id = OLD.replaces_id OR (
+                    other.bot_id = OLD.bot_id AND other.active = 1
+                    AND other.normalized_text = bot_evolution_notes.normalized_text
+                ))
+              );
+        END;
     """)
 
 
-NOTE_SELECT = """
-    SELECT n.id, n.kind, n.text, n.keywords_json, n.evidence, n.active,
+_NOTE_FIELDS = """
+           n.id, n.kind, n.text, n.keywords_json, n.evidence, n.active,
            n.replaces_id, n.created_at, n.source_message_id,
            m.session_id AS source_session_id, s.title AS source_session_title
+"""
+_NOTE_FROM = """
     FROM bot_evolution_notes n
     JOIN messages m ON m.id = n.source_message_id
     JOIN sessions s ON s.id = m.session_id
 """
+NOTE_SELECT = "SELECT " + _NOTE_FIELDS + _NOTE_FROM
+_TRAIT_JOIN = " LEFT JOIN agent_evolution_traits t ON t.note_id = n.id "
+_SKILL_FIELD = """CASE WHEN t.note_id IS NOT NULL THEN
+    json_object('name', t.skill_name, 'phase', t.phase, 'instruction', t.instruction) END AS skill_json"""
 
 
 def _public_note(row) -> dict:
     note = dict(row)
     note["keywords"] = json.loads(note.pop("keywords_json"))
     note["active"] = bool(note["active"])
+    if "skill_json" in note:
+        skill = note.pop("skill_json")
+        note["skill"] = json.loads(skill) if skill is not None else None
     return note
 
 
@@ -104,11 +149,25 @@ def _match_score(note: dict, query: str) -> int:
     return score
 
 
-def get_evolution(db: Connection, bot_id: int, recent_text: str) -> dict:
+def active_traits(db: Connection, bot_id: int, base_hash: str) -> list[dict]:
+    rows = db.execute(f"""
+        SELECT n.id AS note_id, n.text AS description, t.skill_name AS name, t.phase, t.instruction
+        FROM agent_evolution_traits t JOIN bot_evolution_notes n ON n.id = t.note_id
+        JOIN messages m ON m.id = n.source_message_id JOIN bots b ON b.id = n.bot_id
+        WHERE n.bot_id = ? AND n.active = 1 AND b.role_mode != 'mirror' AND t.base_hash = ?
+          AND {visible_agent_message}
+        ORDER BY n.id
+    """, (bot_id, base_hash))
+    return [dict(row) for row in rows]
+
+
+def get_evolution(db: Connection, bot_id: int, recent_text: str, *, base_hash: str | None = None) -> dict:
     """Recall this bot's notes. Turning off auto-updates keeps existing notes readable."""
-    rows = db.execute(
-        NOTE_SELECT + " WHERE n.bot_id = ? AND n.active = 1 ORDER BY n.id DESC", (bot_id,),
-    )
+    rows = db.execute(f"""
+        SELECT {_NOTE_FIELDS}, {_SKILL_FIELD} {_NOTE_FROM} {_TRAIT_JOIN}
+        WHERE n.bot_id = ? AND n.active = 1 AND (t.note_id IS NULL OR t.base_hash = ?)
+          AND {visible_agent_message} ORDER BY n.id DESC
+    """, (bot_id, base_hash))
     notes = [_public_note(row) for row in rows]
     query = normalize(recent_text)
     scored = [(score, note) for note in notes if (score := _match_score(note, query))]
@@ -121,12 +180,14 @@ def get_evolution(db: Connection, bot_id: int, recent_text: str) -> dict:
 
 
 def remember_evolution(db: Connection, bot_id: int, source_message_id: int, proposal,
-                       *, seen_note_ids: Collection[int]) -> dict | None:
+                       *, seen_note_ids: Collection[int], base_hash: str | None = None) -> dict | None:
     """Persist one evidenced note under the same transaction as its visible reply."""
-    if proposal is None:
+    if not isinstance(proposal, dict):
         return None
+    note_fields = dict(proposal)
+    raw_skill = note_fields.pop("skill", None)
     try:
-        draft = EvolutionProposal.model_validate(proposal)
+        draft = EvolutionProposal.model_validate(note_fields)
     except ValidationError:
         return None
     keywords = {
@@ -141,29 +202,54 @@ def remember_evolution(db: Connection, bot_id: int, source_message_id: int, prop
         db.execute("BEGIN IMMEDIATE")
     if not _enabled(db, bot_id):
         return None
-    source = db.execute("""
-        SELECT m.content FROM messages m JOIN bots b ON b.id = m.bot_id
-        WHERE m.id = ? AND m.role = 'assistant' AND b.id = ?
+    source = db.execute(f"""
+        SELECT m.content, p.prompt FROM messages m JOIN bots b ON b.id = m.bot_id
+        JOIN personas p ON p.id = b.persona_id
+        WHERE m.id = ? AND m.role = 'assistant' AND b.id = ? AND b.enabled = 1
+          AND b.role_mode != 'mirror' AND {visible_agent_message}
     """, (source_message_id, bot_id)).fetchone()
     if source is None or draft.evidence not in source["content"]:
         return None
-    already_saved = db.execute("""
-        SELECT 1 FROM bot_evolution_notes WHERE source_message_id = ?
-           OR (bot_id = ? AND normalized_text = ? AND active = 1)
-    """, (source_message_id, bot_id, normalized_text)).fetchone()
-    if already_saved:
+    if base_hash is not None and base_hash != persona_source_hash(source["prompt"]):
         return None
+    skill = None
+    if raw_skill is not None and base_hash:
+        try:
+            skill = EvolutionSkill.model_validate(raw_skill)
+        except ValidationError:
+            pass  # A valid ordinary note can still be retained.
 
     replaces_id = draft.replaces_id
     if replaces_id is not None:
         if replaces_id not in seen_note_ids:
             return None
-        current = db.execute("""
-            SELECT 1 FROM bot_evolution_notes
-            WHERE id = ? AND bot_id = ? AND kind = ? AND active = 1
+        current = db.execute(f"""
+            SELECT t.base_hash, t.skill_name, t.phase, t.instruction, n.normalized_text
+            {_NOTE_FROM} {_TRAIT_JOIN}
+            WHERE n.id = ? AND n.bot_id = ? AND n.kind = ? AND n.active = 1 AND {visible_agent_message}
         """, (replaces_id, bot_id, draft.kind)).fetchone()
         if current is None:
             return None
+        if current["base_hash"] is not None:
+            if not skill or current["base_hash"] != base_hash:
+                return None
+            if (normalized_text, skill.name, skill.phase, skill.instruction) == tuple(
+                current[field] for field in ("normalized_text", "skill_name", "phase", "instruction")
+            ):
+                return None
+
+    # A skill-only revision may keep the predecessor's public description.
+    revised_note = replaces_id if skill and replaces_id is not None else 0
+    already_saved = db.execute(f"""
+        SELECT 1 FROM bot_evolution_notes n {_TRAIT_JOIN}
+        WHERE n.source_message_id = ? OR (
+            n.bot_id = ? AND n.normalized_text = ? AND n.active = 1
+            AND (t.note_id IS NULL OR t.base_hash = ?)
+            AND n.id != ?
+        )
+    """, (source_message_id, bot_id, normalized_text, base_hash, revised_note)).fetchone()
+    if already_saved:
+        return None
 
     note_id = db.execute("""
         INSERT INTO bot_evolution_notes (
@@ -175,6 +261,11 @@ def remember_evolution(db: Connection, bot_id: int, source_message_id: int, prop
         json.dumps(list(keywords.values()), ensure_ascii=False), draft.evidence,
         timestamp(), replaces_id,
     )).lastrowid
+    if skill:
+        db.execute("""
+            INSERT INTO agent_evolution_traits (note_id, base_hash, skill_name, phase, instruction)
+            VALUES (?, ?, ?, ?, ?)
+        """, (note_id, base_hash, skill.name, skill.phase, skill.instruction))
     if replaces_id is not None:
         db.execute("UPDATE bot_evolution_notes SET active = 0 WHERE id = ?", (replaces_id,))
     return _public_note(db.execute(NOTE_SELECT + " WHERE n.id = ?", (note_id,)).fetchone())
@@ -241,6 +332,43 @@ def evolution_state(bot_id: int):
             NOTE_SELECT + " WHERE n.bot_id = ? ORDER BY n.id DESC LIMIT 200", (bot_id,),
         )
         return {"enabled": _enabled(db, bot_id), "notes": [_public_note(row) for row in rows]}
+
+
+@router.get("/path")
+def evolution_path(bot_id: int):
+    with connect() as db:
+        db.execute("BEGIN")
+        base = db.execute("""
+            SELECT p.prompt, b.role_mode, compiled.source_hash, compiled.version
+            FROM bots b JOIN personas p ON p.id = b.persona_id
+            LEFT JOIN agent_persona_programs compiled ON compiled.persona_id = p.id
+            WHERE b.id = ?
+        """, (bot_id,)).fetchone()
+        if base is None:
+            raise HTTPException(404, "Agent 不存在。")
+        base_hash = persona_source_hash(base["prompt"])
+        rows = db.execute(f"""
+            SELECT {_NOTE_FIELDS}, {_SKILL_FIELD}, CASE
+                WHEN NOT ({visible_agent_message}) THEN 'source_hidden'
+                WHEN t.note_id IS NOT NULL AND (t.base_hash != ? OR ? = 'mirror') THEN 'previous_base'
+                WHEN n.active = 0 THEN 'superseded'
+                ELSE 'active' END AS status
+            {_NOTE_FROM} {_TRAIT_JOIN} WHERE n.bot_id = ? ORDER BY n.id
+        """, (base_hash, base["role_mode"], bot_id))
+        events = []
+        revisions = {}
+        for row in rows:
+            event = _public_note(row)
+            event["previous"] = revisions.get(event["replaces_id"])
+            revisions[event["id"]] = {"text": event["text"], "skill": event["skill"]}
+            events.append(event)
+        return {
+            "enabled": _enabled(db, bot_id),
+            "base_description": base["prompt"],
+            "base_version": base["version"] if base["source_hash"] == base_hash else None,
+            "traits": active_traits(db, bot_id, base_hash),
+            "events": events,
+        }
 
 
 @router.patch("")

@@ -5,6 +5,8 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from typing import Annotated
 
+from .agent_store import get_agent_metadata, visible_agent_message
+
 
 class Input(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
@@ -23,18 +25,21 @@ class SessionPatch(Input):
     title: Title | None = None
     archived: bool | None = None
     summary_share_enabled: bool | None = None
+    archive_share_enabled: bool | None = None
 
 
 class ChatInput(Input):
     content: str = Field(min_length=1, max_length=20000)
     bot_ids: list[int] | None = Field(default=None, max_length=6)
     discuss: bool = False
+    use_agent: bool = False
     rewind_message_id: int | None = Field(default=None, gt=0, strict=True)
 
 
 class InterjectInput(Input):
     bot_id: int = Field(gt=0, strict=True)
     message_id: int = Field(gt=0, strict=True)
+    use_agent: bool = False
 
 
 class RewindInput(Input):
@@ -72,7 +77,8 @@ def timestamp():
 
 
 SESSION_SELECT = """
-    SELECT s.*, EXISTS (SELECT 1 FROM summaries m WHERE m.session_id = s.id) AS has_summary
+    SELECT s.*, EXISTS (SELECT 1 FROM summaries m WHERE m.session_id = s.id) AS has_summary,
+        COALESCE((SELECT enabled FROM agent_archive_sharing a WHERE a.session_id = s.id), 0) AS archive_share_enabled
     FROM sessions s
 """
 
@@ -81,6 +87,7 @@ def clean_session(row):
     session = dict(row)
     session["archived"] = bool(session["archived"])
     session["summary_share_enabled"] = bool(session["summary_share_enabled"])
+    session["archive_share_enabled"] = bool(session["archive_share_enabled"])
     session["has_summary"] = bool(session["has_summary"])
     return session
 
@@ -118,8 +125,14 @@ def clean_message(row):
 
 
 def get_messages(db, session_id):
-    rows = db.execute("SELECT * FROM messages WHERE session_id = ? ORDER BY id", (session_id,))
+    rows = db.execute(f"""
+        SELECT m.* FROM messages m WHERE m.session_id = ? AND {visible_agent_message} ORDER BY m.id
+    """, (session_id,))
     messages = [clean_message(row) for row in rows]
+    metadata = get_agent_metadata(db, session_id)
+    for message in messages:
+        if message["id"] in metadata:
+            message["agent"] = metadata[message["id"]]
     references = [ref for message in messages for ref in message["references"]]
     if references:
         session_ids = {row["id"] for row in db.execute("SELECT id FROM sessions")}
