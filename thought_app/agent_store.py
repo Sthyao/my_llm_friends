@@ -1,7 +1,6 @@
 """Persist agent memory and archive provenance in the journal database."""
 
-from exp.archive import rank_evidence
-
+from .archive_search import rank_evidence
 from .database import connect
 
 

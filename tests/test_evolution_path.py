@@ -9,7 +9,7 @@ from zipfile import ZipFile
 
 from fastapi.testclient import TestClient
 
-from exp.harness import persona_source_hash
+from thought_app.agent_runtime import persona_source_hash
 from thought_app.app import app
 from thought_app.database import connect
 from thought_app.evolution import remember_evolution

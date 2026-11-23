@@ -4,11 +4,11 @@ import asyncio
 from dataclasses import dataclass
 import logging
 
-from exp.harness import Harness, asks_archive, persona_source_hash
 from fastapi import HTTPException
 
 from . import llm
 from .agent_config import AgentModel, effective_agent_settings, ensure_profile
+from .agent_runtime import AgentDecisionLoop, asks_archive, persona_source_hash
 from .agent_store import (
     AgentStore, apply_agent_change, store_agent_metadata, store_agent_sources, validate_agent_sources,
     visible_agent_message,
@@ -62,7 +62,7 @@ async def plan_agents(bots, messages, turn, target, preferences, *, directed, ob
     explicit = archive_bot is not None and target["role"] == "user" and asks_archive(text)
     archive = None
     if explicit:
-        loop = Harness(store, AgentModel(archive_bot, effective_agent_settings(archive_bot, preferences)), names)
+        loop = AgentDecisionLoop(store, AgentModel(archive_bot, effective_agent_settings(archive_bot, preferences)), names)
         try:
             archive = await loop.archive_context(
                 turn["session_id"], text, [*short, {"id": target["id"]}, {"id": turn["id"]}],
@@ -90,7 +90,7 @@ async def plan_agents(bots, messages, turn, target, preferences, *, directed, ob
             scoped_profile = {**profile, "learned_skills": [
                 note["skill"] for note in evolution["notes"] if note.get("skill")
             ]}
-        loop = Harness(store, AgentModel(bot, settings), names)
+        loop = AgentDecisionLoop(store, AgentModel(bot, settings), names)
         decision = await loop.decide(
             bot["bot_id"], scoped_profile, text, scoped_short, directed, False, observe and not mirror,
             archive=None if mirror else archive, allow_lookup=not explicit and not mirror,
@@ -112,7 +112,7 @@ async def plan_agents(bots, messages, turn, target, preferences, *, directed, ob
         query = plan.decision.get("archive_query")
         if not query:
             continue
-        loop = Harness(store, AgentModel(plan.bot, plan.preferences), names)
+        loop = AgentDecisionLoop(store, AgentModel(plan.bot, plan.preferences), names)
         try:
             recalled = await loop.archive_context(
                 turn["session_id"], query, [*short, {"id": target["id"]}, {"id": turn["id"]}],

@@ -7,8 +7,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
-from exp.harness import persona_source_hash
-
+from .agent_runtime import persona_source_hash
 from .agent_store import visible_agent_message
 from .database import connect
 from .journal import timestamp

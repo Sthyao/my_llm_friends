@@ -2,8 +2,7 @@
 
 from hashlib import sha256
 
-from exp.harness import persona_source_hash
-
+from .agent_runtime import persona_source_hash
 from .prompts import load_prompt
 
 

@@ -1,7 +1,7 @@
 import sqlite3
 import unittest
 
-from exp.harness import persona_source_hash
+from thought_app.agent_runtime import persona_source_hash
 from thought_app.agent_store import init_agent_store, set_archive_shared, store_agent_sources
 from thought_app.config import init_config
 from thought_app.database import init_journal

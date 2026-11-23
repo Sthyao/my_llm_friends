@@ -7,8 +7,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from exp.harness import persona_source_hash
-
+from .agent_runtime import persona_source_hash
 from .database import connect
 from .evolution import active_traits
 from .llm import ModelError, complete, supports_thinking, supports_web_search

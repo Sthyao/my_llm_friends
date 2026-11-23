@@ -7,9 +7,8 @@ from fastapi import APIRouter, HTTPException, Response
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from exp.harness import COMPILER, persona_source_hash, validate_profile
-
 from . import llm
+from .agent_runtime import COMPILER, persona_source_hash, validate_profile
 from .config import ConfigInput, get_bot, get_model, get_router_model
 from .database import connect
 
